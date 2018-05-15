@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+#
+# Simple investments distribution calculator
+#
+
+from typing import List
+
+
+class Holding:
+    def __init__(self, name, weight, ticker=None, holdings=None):
+        if ticker is not None:
+            name = "{} ({})".format(name, ticker)
+
+        self.name = name
+        self.weight = weight
+        self.holdings = holdings or []
+
+
+class Error(Exception):
+    def __init__(self, *args):
+        message, args = args[0], args[1:]
+        super().__init__(message.format(*args) if args else message)
+
+
+def calculate(name, holdings: List[Holding], assets, depth=0):
+    if sum(holding.weight for holding in holdings) != 100:
+        raise Error("Invalid weights for {!r}.", name)
+
+    for holding in holdings:
+        value = assets * holding.weight // 100
+
+        title = "{indent}* {name} - {weight}% (${value})".format(
+            indent="  " * depth, name=holding.name, weight=holding.weight, value=value)
+        if holding.holdings:
+            title += ":"
+
+        print(title)
+        if holding.holdings:
+            calculate(holding.name, holding.holdings, value, depth=depth + 1)
+
+
+def main():
+    assets = 25000
+    calculate("Holdings", [], assets)
+
+
+if __name__ == "__main__":
+    main()
