@@ -1,19 +1,60 @@
 #!/usr/bin/env python3
-#
-# Simple investments distribution calculator
-#
 
+"""Investments distribution calculator"""
+
+import argparse
+import operator
+
+from decimal import Decimal
 from typing import List
+
+import requests
+
+
+class Actions:
+    SHOW = "show"
+    REBALANCE = "rebalance"
+
+    ALL = [SHOW, REBALANCE]
+
+
+class Currency:
+    USD = "usd"
+    RUB = "rub"
 
 
 class Holding:
-    def __init__(self, name, weight, ticker=None, holdings=None):
-        if ticker is not None:
+    def __init__(self, name, weight, ticker=None, shares=None, holdings=None):
+        if ticker is None:
+            if not holdings:
+                raise Error("Invalid holding {!r}: ticker must be specified.", name)
+        else:
             name = "{} ({})".format(name, ticker)
 
+        if (ticker is None) != (shares is None):
+            raise Error("Invalid holding {!r}: ticker must be specified with shares.", name)
+
+        self.ticker = ticker
         self.name = name
-        self.weight = weight
+        self.weight = Decimal(weight) / 100
+        self.shares = shares
+
+        self.price = None
+        self.value = None
+
+        self.rebalanced_shares = None
+        self.rebalanced_value = None
+
         self.holdings = holdings or []
+
+
+class Portfolio:
+    def __init__(self, name, currency, *, transaction_fee, holdings: List[Holding], free_assets):
+        self.name = name
+        self.currency = currency
+        self.transaction_fee = transaction_fee
+        self.holdings = holdings
+        self.free_assets = Decimal(free_assets)
 
 
 class Error(Exception):
@@ -22,26 +63,232 @@ class Error(Exception):
         super().__init__(message.format(*args) if args else message)
 
 
-def calculate(name, holdings: List[Holding], assets, depth=0):
-    if sum(holding.weight for holding in holdings) != 100:
-        raise Error("Invalid weights for {!r}.", name)
+class LogicalError(Error):
+    def __init__(self):
+        super().__init__("Logical error.")
+
+
+def calculate(portfolio: Portfolio, *, fake_prices=False):
+    tickers = set()
+
+    def process(name, holdings: List[Holding]):
+        if holdings and sum(holding.weight for holding in holdings) != 1:
+            raise Error("Invalid weights for {!r}.", name)
+
+        for holding in holdings:
+            if holding.ticker is not None:
+                tickers.add(holding.ticker)
+
+            process(holding.name, holding.holdings)
+
+    process(portfolio.name, portfolio.holdings)
+
+    if fake_prices:
+        prices = {ticker: Decimal(1) for ticker in tickers}
+    else:
+        prices = get_prices(tickers)
+
+    current_value = calculate_current_value(portfolio.holdings, prices)
+    total_value = current_value + portfolio.free_assets
+
+    rebalanced_value, commissions = rebalance(portfolio.holdings, total_value, portfolio.transaction_fee)
+
+    return rebalanced_value, total_value - rebalanced_value - commissions, commissions
+
+
+def calculate_current_value(holdings: List[Holding], prices):
+    total_value = 0
 
     for holding in holdings:
-        value = assets * holding.weight // 100
+        if holding.shares is None:
+            holding.value = calculate_current_value(holding.holdings, prices)
+        else:
+            holding.price = prices[holding.ticker]
+            holding.value = holding.shares * holding.price
 
-        title = "{indent}* {name} - {weight}% (${value})".format(
-            indent="  " * depth, name=holding.name, weight=holding.weight, value=value)
+        total_value += holding.value
+
+    return total_value
+
+
+def rebalance(holdings: List[Holding], expected_total_value, transaction_fee):
+    total_rebalanced_value = 0
+    total_commissions = 0
+
+    for holding in holdings:
+        if holding.shares is None:
+            rebalanced_value, commissions = rebalance(
+                holding.holdings, expected_total_value * holding.weight, transaction_fee)
+
+            if rebalanced_value != holding.value:
+                holding.rebalanced_value = rebalanced_value
+
+            total_commissions += commissions
+        else:
+            current_weight = get_weight(expected_total_value, holding.value)
+
+            if current_weight != holding.weight:
+                expected_value = expected_total_value * holding.weight
+                rebalanced_shares = expected_value // holding.price
+
+                if rebalanced_shares != holding.shares:
+                    holding.rebalanced_shares = rebalanced_shares
+                    holding.rebalanced_value = holding.rebalanced_shares * holding.price
+                    total_commissions += transaction_fee
+
+        total_rebalanced_value += holding.value if holding.rebalanced_value is None else holding.rebalanced_value
+
+    return total_rebalanced_value, total_commissions
+
+
+def show(action, portfolio: Portfolio, holdings: List[Holding], expected_total_value, *, depth=0):
+    for holding in sorted(holdings, key=operator.attrgetter("weight"), reverse=True):
+        title = "{indent}* {name}".format(indent="  " * depth, name=holding.name)
+        expected_value = expected_total_value * holding.weight
+
+        if action != Actions.SHOW:
+            title += " -"
+
+            if holding.shares is not None:
+                title += " " + format_shares(holding.shares)
+
+            current_weight = get_weight(expected_total_value, holding.value)
+            title += " {weight} ({value})".format(
+                weight=format_weight(current_weight), value=format_assets(holding.value, portfolio.currency))
+
+            if holding.rebalanced_value is not None:
+                if holding.rebalanced_shares is not None:
+                    title += " " + format_shares(holding.rebalanced_shares - holding.shares, sign=True)
+
+                rebalanced_weight = get_weight(expected_total_value, holding.rebalanced_value)
+                title += " -> {weight} ({value})".format(
+                    weight=format_weight(rebalanced_weight),
+                    value=format_assets(holding.rebalanced_value, portfolio.currency))
+
+        title += " {delimiter} {weight} ({value})".format(
+            delimiter="-" if action == Actions.SHOW else "/",
+            weight=format_weight(holding.weight),
+            value=format_assets(expected_value, portfolio.currency))
+
         if holding.holdings:
             title += ":"
 
         print(title)
-        if holding.holdings:
-            calculate(holding.name, holding.holdings, value, depth=depth + 1)
+        show(action, portfolio, holding.holdings, expected_value, depth=depth + 1)
 
 
+def get_weight(assets, value):
+    if value == 0:
+        return Decimal(1)
+    else:
+        return Decimal(value) / assets
+
+
+def format_shares(shares, sign=False):
+    format_string = "{"
+    if sign:
+        format_string += ":+"
+    format_string += "}￥"
+    return format_string.format(shares)
+
+
+def format_assets(assets, currency):
+    string = str(int(assets))
+
+    if currency == Currency.USD:
+        string = "$" + string
+    elif currency == Currency.RUB:
+        string += "₽"
+    else:
+        raise LogicalError()
+
+    return string
+
+
+def format_weight(weight):
+    return ("{:.1f}".format(weight * 100).rstrip("0").rstrip(".") or "0") + "%"
+
+
+def get_prices(tickers):
+    prices = {}
+    if not tickers:
+        return prices
+
+    response = requests.get("https://www.alphavantage.co/query", params={
+        "function": "BATCH_STOCK_QUOTES",
+        "symbols": ",".join(tickers),
+        "apikey": "api-key-stub"
+    })
+    response.raise_for_status()
+    result = response.json()
+
+    if "Error Message" in result:
+        raise Error("Unable to get tickers info: {}", result["Error Message"])
+
+    for quote in result["Stock Quotes"]:
+        prices[quote["1. symbol"]] = Decimal(quote["2. price"])
+
+    unknown_tickers = set(tickers) - set(prices)
+    if not unknown_tickers:
+        return prices
+
+    # See http://iss.moex.com/iss/reference/
+    response = requests.get("https://iss.moex.com/iss/engines/stock/markets/shares/securities.json", params={
+        "securities": ",".join(unknown_tickers),
+    })
+    response.raise_for_status()
+    result = response.json()
+
+    market_data = result["marketdata"]
+    columns = market_data["columns"]
+    ticker_column_id = columns.index("SECID")
+    board_column_id = columns.index("BOARDID")
+    price_column_id = columns.index("LAST")
+
+    for data in market_data["data"]:
+        ticker = data[ticker_column_id]
+        if ticker in unknown_tickers and data[board_column_id] == "TQTF":
+            prices[ticker] = Decimal(data[price_column_id])
+
+    unknown_tickers = set(tickers) - set(prices)
+    if unknown_tickers:
+        raise Error("Unable to get info for the following tickers: {}.", ", ".join(unknown_tickers))
+
+    return prices
+
+
+def process_portfolio(action, portfolio: Portfolio):
+    print(portfolio.name + ":")
+
+    if action == Actions.SHOW:
+        calculate(portfolio, fake_prices=True)
+        show(action, portfolio, portfolio.holdings, portfolio.free_assets)
+    else:
+        total_value, free_assets, commissions = calculate(portfolio)
+        show(action, portfolio, portfolio.holdings, total_value)
+
+        print()
+        print("Total value: " + format_assets(total_value, portfolio.currency))
+        print("Free assets: " + format_assets(free_assets, portfolio.currency))
+        print("Commissions: " + format_assets(commissions, portfolio.currency))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=Actions.ALL, help="action to process")
+    return parser.parse_args()
+
+
+# FIXME: Freeze
 def main():
-    assets = 25000
-    calculate("Holdings", [], assets)
+    portfolios = []
+    args = parse_args()
+
+    for portfolio_id, portfolio in enumerate(portfolios):
+        if portfolio_id:
+            print("\n")
+
+        process_portfolio(args.action, portfolio)
 
 
 if __name__ == "__main__":
