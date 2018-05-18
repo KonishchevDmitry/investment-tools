@@ -36,25 +36,39 @@ class Holding:
 
         self.ticker = ticker
         self.name = name
-        self.weight = Decimal(weight) / 100
         self.shares = shares
+        self.expected_weight = Decimal(weight) / 100
 
         self.price = None
         self.value = None
+
+        self.selling_restricted = None
+        self.sell_blocked = False
+
+        self.weight = self.expected_weight
+        self.minimum_value = None
 
         self.rebalanced_shares = None
         self.rebalanced_value = None
 
         self.holdings = holdings or []
 
+    def restrict_selling(self, restrict=True):
+        apply_restriction(self.holdings, "selling_restricted", restrict)
+        return self
+
 
 class Portfolio:
     def __init__(self, name, currency, *, transaction_fee, holdings: List[Holding], free_assets):
         self.name = name
         self.currency = currency
-        self.transaction_fee = transaction_fee
+        self.transaction_fee = Decimal(transaction_fee)
         self.holdings = holdings
         self.free_assets = Decimal(free_assets)
+
+    def restrict_selling(self, restrict=True):
+        apply_restriction(self.holdings, "selling_restricted", restrict)
+        return self
 
 
 class Error(Exception):
@@ -68,11 +82,23 @@ class LogicalError(Error):
         super().__init__("Logical error.")
 
 
+def apply_restriction(holdings: List[Holding], name, value):
+    for holding in holdings:
+        if holding.shares is None:
+            apply_restriction(holding.holdings, name, value)
+        else:
+            if not hasattr(holding, name):
+                raise LogicalError()
+
+            if getattr(holding, name) is None:
+                setattr(holding, name, value)
+
+
 def calculate(portfolio: Portfolio, *, fake_prices=False):
     tickers = set()
 
     def process(name, holdings: List[Holding]):
-        if holdings and sum(holding.weight for holding in holdings) != 1:
+        if holdings and sum(holding.expected_weight for holding in holdings) != 1:
             raise Error("Invalid weights for {!r}.", name)
 
         for holding in holdings:
@@ -91,13 +117,17 @@ def calculate(portfolio: Portfolio, *, fake_prices=False):
     current_value = calculate_current_value(portfolio.holdings, prices)
     total_value = current_value + portfolio.free_assets
 
+    if not fake_prices:
+        calculate_restrictions(portfolio.holdings)
+        correct_weights(portfolio.holdings, total_value)  # TODO: Display overuse?
+
     rebalanced_value, commissions = rebalance(portfolio.holdings, total_value, portfolio.transaction_fee)
 
     return rebalanced_value, total_value - rebalanced_value - commissions, commissions
 
 
 def calculate_current_value(holdings: List[Holding], prices):
-    total_value = 0
+    total_value = Decimal()
 
     for holding in holdings:
         if holding.shares is None:
@@ -111,9 +141,71 @@ def calculate_current_value(holdings: List[Holding], prices):
     return total_value
 
 
+def calculate_restrictions(holdings: List[Holding]):
+    total_minimum_value = None
+
+    for holding in holdings:
+        if holding.shares is None:
+            holding.minimum_value = calculate_restrictions(holding.holdings)
+        else:
+            if holding.selling_restricted:
+                holding.minimum_value = holding.value
+
+        if holding.minimum_value is not None:
+            if total_minimum_value is None:
+                total_minimum_value = holding.minimum_value
+            else:
+                total_minimum_value += holding.minimum_value
+
+    return total_minimum_value
+
+
+def correct_weights(holdings: List[Holding], expected_total_value):
+    while True:
+        succeeded = True
+        total_assets_overuse = Decimal()
+        correctable_holdings = holdings[:]
+
+        for holding in holdings:
+            expected_value = expected_total_value * holding.weight
+            if holding.minimum_value is not None and expected_value <= holding.minimum_value:
+                total_assets_overuse += holding.minimum_value - expected_value
+                correctable_holdings.remove(holding)
+
+        if total_assets_overuse:
+            if correctable_holdings:
+                expected_value = Decimal()
+                for holding in correctable_holdings:
+                    expected_value += expected_total_value * holding.weight
+
+                correction_multiplicator = (expected_value - total_assets_overuse) / expected_value
+
+                for holding in correctable_holdings:
+                    corrected_weight = holding.weight * correction_multiplicator
+
+                    if (
+                        holding.minimum_value is not None and
+                        expected_total_value * corrected_weight < holding.minimum_value
+                    ):
+                        corrected_weight = holding.minimum_value / expected_total_value
+                        succeeded = False
+
+                    holding.weight = corrected_weight
+            else:
+                succeeded = False
+
+        if not succeeded and correctable_holdings:
+            continue
+
+        for holding in holdings:
+            succeeded &= correct_weights(holding.holdings, expected_total_value * holding.weight)
+
+        return succeeded
+
+
 def rebalance(holdings: List[Holding], expected_total_value, transaction_fee):
-    total_rebalanced_value = 0
-    total_commissions = 0
+    total_rebalanced_value = Decimal()
+    total_commissions = Decimal()
 
     for holding in holdings:
         if holding.shares is None:
@@ -128,13 +220,15 @@ def rebalance(holdings: List[Holding], expected_total_value, transaction_fee):
             current_weight = get_weight(expected_total_value, holding.value)
 
             if current_weight != holding.weight:
-                expected_value = expected_total_value * holding.weight
-                rebalanced_shares = expected_value // holding.price
+                rebalanced_shares = expected_total_value * holding.weight // holding.price
 
                 if rebalanced_shares != holding.shares:
-                    holding.rebalanced_shares = rebalanced_shares
-                    holding.rebalanced_value = holding.rebalanced_shares * holding.price
-                    total_commissions += transaction_fee
+                    if rebalanced_shares < holding.shares and holding.selling_restricted:
+                        holding.sell_blocked = True
+                    else:
+                        holding.rebalanced_shares = rebalanced_shares
+                        holding.rebalanced_value = holding.rebalanced_shares * holding.price
+                        total_commissions += transaction_fee
 
         total_rebalanced_value += holding.value if holding.rebalanced_value is None else holding.rebalanced_value
 
@@ -147,6 +241,9 @@ def show(action, portfolio: Portfolio, holdings: List[Holding], expected_total_v
         expected_value = expected_total_value * holding.weight
 
         if action != Actions.SHOW:
+            if holding.sell_blocked:
+                title += " [sell blocked]"
+
             title += " -"
 
             if holding.shares is not None:
@@ -167,8 +264,8 @@ def show(action, portfolio: Portfolio, holdings: List[Holding], expected_total_v
 
         title += " {delimiter} {weight} ({value})".format(
             delimiter="-" if action == Actions.SHOW else "/",
-            weight=format_weight(holding.weight),
-            value=format_assets(expected_value, portfolio.currency))
+            weight=format_weight(holding.expected_weight),
+            value=format_assets(expected_total_value * holding.expected_weight, portfolio.currency))
 
         if holding.holdings:
             title += ":"
@@ -181,7 +278,7 @@ def get_weight(assets, value):
     if value == 0:
         return Decimal(1)
     else:
-        return Decimal(value) / assets
+        return value / assets
 
 
 def format_shares(shares, sign=False):
@@ -279,7 +376,6 @@ def parse_args():
     return parser.parse_args()
 
 
-# FIXME: Freeze
 def main():
     portfolios = []
     args = parse_args()
