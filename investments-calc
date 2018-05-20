@@ -77,11 +77,33 @@ class Holding:
         return self
 
 
+class CommissionSpec:
+    def __init__(self, *, minimum, percent=None, per_share=None, maximum_percent=None):
+        self.__minimum = Decimal(minimum)
+        self.__percent = None if percent is None else Decimal(percent)
+        self.__per_share = None if per_share is None else Decimal(per_share)
+        self.__maximum_percent = None if maximum_percent is None else Decimal(maximum_percent)
+
+    def calculate(self, shares, price):
+        commissions = Decimal()
+
+        if self.__percent is not None:
+            commissions += shares * price * self.__percent / 100
+
+        if self.__per_share is not None:
+            commissions += shares * self.__per_share
+
+        if self.__maximum_percent is not None:
+            commissions = min(commissions, shares * price * self.__maximum_percent / 100)
+
+        return max(self.__minimum, commissions)
+
+
 class Portfolio:
-    def __init__(self, name, currency, *, transaction_fee, holdings: List[Holding], free_assets):
+    def __init__(self, name, currency, commission_spec: CommissionSpec, *, holdings: List[Holding], free_assets):
         self.name = name
         self.currency = currency
-        self.transaction_fee = Decimal(transaction_fee)
+        self.commission_spec = commission_spec
         self.holdings = holdings
         self.free_assets = Decimal(free_assets)
 
@@ -145,7 +167,7 @@ def calculate(portfolio: Portfolio, *, fake_prices=False):
         correct_weights_for_buying_restriction(portfolio.holdings, total_value)  # TODO: Display underuse?
         correct_weights_for_selling_restriction(portfolio.holdings, total_value)  # TODO: Display overuse?
 
-    rebalanced_value, commissions = rebalance(portfolio.holdings, total_value, portfolio.transaction_fee)
+    rebalanced_value, commissions = rebalance(portfolio.holdings, total_value, portfolio.commission_spec)
 
     return rebalanced_value, total_value - rebalanced_value - commissions, commissions
 
@@ -288,14 +310,15 @@ def correct_weights_for_buying_restriction(holdings: List[Holding], expected_tot
         return succeeded
 
 
-def rebalance(holdings: List[Holding], expected_total_value, transaction_fee):
+def rebalance(holdings: List[Holding], expected_total_value, commission_spec: CommissionSpec):
     total_rebalanced_value = Decimal()
     total_commissions = Decimal()
 
     for holding in holdings:
+        expected_value = expected_total_value * holding.weight
+
         if holding.is_group:
-            rebalanced_value, commissions = rebalance(
-                holding.holdings, expected_total_value * holding.weight, transaction_fee)
+            rebalanced_value, commissions = rebalance(holding.holdings, expected_value, commission_spec)
 
             if rebalanced_value != holding.value:
                 holding.rebalanced_value = rebalanced_value
@@ -305,7 +328,11 @@ def rebalance(holdings: List[Holding], expected_total_value, transaction_fee):
             current_weight = get_weight(expected_total_value, holding.value)
 
             if current_weight != holding.weight:
-                rebalanced_shares = expected_total_value * holding.weight // holding.price
+                rebalanced_shares = expected_value // holding.price
+
+                if rebalanced_shares != holding.shares:
+                    commissions = commission_spec.calculate(abs(rebalanced_shares - holding.shares), holding.price)
+                    rebalanced_shares = (expected_value - commissions) // holding.price
 
                 if rebalanced_shares != holding.shares:
                     if rebalanced_shares < holding.shares and holding.selling_restricted:
@@ -315,7 +342,8 @@ def rebalance(holdings: List[Holding], expected_total_value, transaction_fee):
                     else:
                         holding.rebalanced_shares = rebalanced_shares
                         holding.rebalanced_value = holding.rebalanced_shares * holding.price
-                        total_commissions += transaction_fee
+                        total_commissions += commission_spec.calculate(
+                            abs(rebalanced_shares - holding.shares), holding.price)
 
         total_rebalanced_value += holding.value if holding.rebalanced_value is None else holding.rebalanced_value
 
@@ -368,7 +396,7 @@ def show(action, portfolio: Portfolio, holdings: List[Holding], expected_total_v
 
 
 def get_weight(assets, value):
-    if value == 0:
+    if assets == 0:
         return Decimal(1)
     else:
         return value / assets
@@ -378,7 +406,7 @@ def format_shares(shares, sign=False):
     format_string = "{"
     if sign:
         format_string += ":+"
-    format_string += "}Q"
+    format_string += "}s"
     return format_string.format(shares)
 
 
