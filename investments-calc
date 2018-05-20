@@ -23,60 +23,6 @@ class Currency:
     RUB = "rub"
 
 
-class Holding:
-    def __init__(self, name, weight, ticker=None, shares=None, holdings=None):
-        if ticker is None:
-            if not holdings:
-                raise Error("Invalid holding {!r}: ticker must be specified.", name)
-        else:
-            name = "{} ({})".format(name, ticker)
-
-        if (ticker is None) != (shares is None):
-            raise Error("Invalid holding {!r}: ticker must be specified with shares.", name)
-
-        self.ticker = ticker
-        self.name = name
-        self.shares = shares
-        self.expected_weight = Decimal(weight) / 100
-
-        self.price = None
-        self.value = None
-
-        self.minimum_value = None
-        self.selling_restricted = None
-        self.sell_blocked = False
-
-        self.maximum_value = None
-        self.buying_restricted = None
-        self.buy_blocked = False
-
-        self.weight = self.expected_weight
-        self.rebalanced_shares = None
-        self.rebalanced_value = None
-
-        self.holdings = holdings or []
-
-    @property
-    def is_group(self):
-        return self.shares is None
-
-    def restrict_selling(self, restrict=True):
-        if self.is_group:
-            apply_restriction(self.holdings, "selling_restricted", restrict)
-        else:
-            self.selling_restricted = restrict
-
-        return self
-
-    def restrict_buying(self, restrict=True):
-        if self.is_group:
-            apply_restriction(self.holdings, "buying_restricted", restrict)
-        else:
-            self.buying_restricted = restrict
-
-        return self
-
-
 class CommissionSpec:
     def __init__(self, *, minimum, percent=None, per_share=None, maximum_percent=None):
         self.__minimum = Decimal(minimum)
@@ -97,6 +43,72 @@ class CommissionSpec:
             commissions = min(commissions, shares * price * self.__maximum_percent / 100)
 
         return max(self.__minimum, commissions)
+
+
+class Holding:
+    def __init__(self, name, weight, ticker=None, shares=None, holdings=None):
+        if (ticker is not None) == bool(holdings):
+            raise Error("Invalid holding {!r}: either ticket or group's holdings must be specified.", name)
+
+        if (ticker is None) != (shares is None):
+            raise Error("Invalid holding {!r}: ticker must be specified with shares.", name)
+
+        if ticker is not None:
+            name = "{} ({})".format(name, ticker)
+
+        self.ticker = ticker
+        self.name = name
+
+        self.expected_weight = Decimal(weight) / 100
+        self.weight = self.expected_weight
+
+        if self.is_group:
+            self.holdings = holdings
+        else:
+            self.current_shares = shares
+            self.shares = shares
+            self.commission = 0
+
+            self.price = None
+
+        self.current_value = None
+        self.value = None
+
+        self.minimum_value = None
+        self.selling_restricted = None
+        self.sell_blocked = False
+
+        self.maximum_value = None
+        self.buying_restricted = None
+        self.buy_blocked = False
+
+    @property
+    def is_group(self):
+        return self.ticker is None
+
+    def restrict_selling(self, restrict=True):
+        if self.is_group:
+            apply_restriction(self.holdings, "selling_restricted", restrict)
+        else:
+            self.selling_restricted = restrict
+
+        return self
+
+    def restrict_buying(self, restrict=True):
+        if self.is_group:
+            apply_restriction(self.holdings, "buying_restricted", restrict)
+        else:
+            self.buying_restricted = restrict
+
+        return self
+
+    def change(self, shares, commission_spec: CommissionSpec):
+        self.commission = self.commission_for(shares, commission_spec)
+        self.shares = shares
+        self.value = shares * self.price
+
+    def commission_for(self, shares, commission_spec: CommissionSpec):
+        return commission_spec.calculate(abs(shares - self.current_shares), self.price)
 
 
 class Portfolio:
@@ -147,17 +159,20 @@ def calculate(portfolio: Portfolio, *, fake_prices=False):
             raise Error("Invalid weights for {!r}.", name)
 
         for holding in holdings:
-            if holding.ticker is not None:
+            if holding.is_group:
+                process(holding.name, holding.holdings)
+            else:
                 tickers.add(holding.ticker)
-
-            process(holding.name, holding.holdings)
 
     process(portfolio.name, portfolio.holdings)
 
     if fake_prices:
         prices = {ticker: Decimal(1) for ticker in tickers}
     else:
-        prices = get_prices(tickers)
+        # FIXME
+        # prices = get_prices(tickers)
+        prices = {'VXUS': Decimal('57.0200'), 'VGT': Decimal('180.8500'), 'MCHI': Decimal('69.1700'), 'BNDX': Decimal('54.3450'), 'IEMG': Decimal('55.8500'), 'VNQI': Decimal('60.7700'), 'VTI': Decimal('140.1950'), 'BND': Decimal('78.5250'), 'IAU': Decimal('12.3950')}
+        prices.update({'FXCN': Decimal('2855'), 'FXIT': Decimal('4227'), 'FXRB': Decimal('1395'), 'FXRL': Decimal('2110'), 'FXUS': Decimal('2996')})
 
     current_value = calculate_current_value(portfolio.holdings, prices)
     total_value = current_value + portfolio.free_assets
@@ -167,7 +182,8 @@ def calculate(portfolio: Portfolio, *, fake_prices=False):
         correct_weights_for_buying_restriction(portfolio.holdings, total_value)  # TODO: Display underuse?
         correct_weights_for_selling_restriction(portfolio.holdings, total_value)  # TODO: Display overuse?
 
-    rebalanced_value, commissions = rebalance(portfolio.holdings, total_value, portfolio.commission_spec)
+    rebalanced_value = rebalance(portfolio.holdings, total_value, portfolio.commission_spec)
+    commissions = calculate_total_commissions(portfolio.holdings)
 
     return rebalanced_value, total_value - rebalanced_value - commissions, commissions
 
@@ -177,12 +193,12 @@ def calculate_current_value(holdings: List[Holding], prices):
 
     for holding in holdings:
         if holding.is_group:
-            holding.value = calculate_current_value(holding.holdings, prices)
+            holding.value = holding.current_value = calculate_current_value(holding.holdings, prices)
         else:
             holding.price = prices[holding.ticker]
-            holding.value = holding.shares * holding.price
+            holding.value = holding.current_value = holding.current_shares * holding.price
 
-        total_value += holding.value
+        total_value += holding.current_value
 
     return total_value
 
@@ -198,10 +214,10 @@ def calculate_restrictions(holdings: List[Holding]):
             holding.minimum_value, holding.maximum_value = calculate_restrictions(holding.holdings)
         else:
             if holding.selling_restricted:
-                holding.minimum_value = holding.value
+                holding.minimum_value = holding.current_value
 
             if holding.buying_restricted:
-                holding.maximum_value = holding.value
+                holding.maximum_value = holding.current_value
 
         if holding.minimum_value is not None:
             if total_minimum_value is None:
@@ -258,8 +274,9 @@ def correct_weights_for_selling_restriction(holdings: List[Holding], expected_to
             continue
 
         for holding in holdings:
-            succeeded &= correct_weights_for_selling_restriction(
-                holding.holdings, expected_total_value * holding.weight)
+            if holding.is_group:
+                succeeded &= correct_weights_for_selling_restriction(
+                    holding.holdings, expected_total_value * holding.weight)
 
         return succeeded
 
@@ -304,50 +321,102 @@ def correct_weights_for_buying_restriction(holdings: List[Holding], expected_tot
             continue
 
         for holding in holdings:
-            succeeded &= correct_weights_for_buying_restriction(
-                holding.holdings, expected_total_value * holding.weight)
+            if holding.is_group:
+                succeeded &= correct_weights_for_buying_restriction(
+                    holding.holdings, expected_total_value * holding.weight)
 
         return succeeded
 
 
 def rebalance(holdings: List[Holding], expected_total_value, commission_spec: CommissionSpec):
-    total_rebalanced_value = Decimal()
-    total_commissions = Decimal()
+    total_value = Decimal()
 
     for holding in holdings:
         expected_value = expected_total_value * holding.weight
 
         if holding.is_group:
-            rebalanced_value, commissions = rebalance(holding.holdings, expected_value, commission_spec)
-
-            if rebalanced_value != holding.value:
-                holding.rebalanced_value = rebalanced_value
-
-            total_commissions += commissions
+            holding.value = rebalance(holding.holdings, expected_value, commission_spec)
         else:
-            current_weight = get_weight(expected_total_value, holding.value)
+            if holding.shares != holding.current_shares:
+                raise LogicalError()
+
+            current_weight = get_weight(expected_total_value, holding.current_value)
 
             if current_weight != holding.weight:
                 rebalanced_shares = expected_value // holding.price
 
-                if rebalanced_shares != holding.shares:
-                    commissions = commission_spec.calculate(abs(rebalanced_shares - holding.shares), holding.price)
+                if rebalanced_shares != holding.current_shares:
+                    commissions = holding.commission_for(rebalanced_shares, commission_spec)
                     rebalanced_shares = (expected_value - commissions) // holding.price
 
-                if rebalanced_shares != holding.shares:
-                    if rebalanced_shares < holding.shares and holding.selling_restricted:
+                if rebalanced_shares != holding.current_shares:
+                    if rebalanced_shares < holding.current_shares and holding.selling_restricted:
                         holding.sell_blocked = True
-                    elif rebalanced_shares > holding.shares and holding.buying_restricted:
+                    elif rebalanced_shares > holding.current_shares and holding.buying_restricted:
                         holding.buy_blocked = True
                     else:
-                        holding.rebalanced_shares = rebalanced_shares
-                        holding.rebalanced_value = holding.rebalanced_shares * holding.price
-                        total_commissions += commission_spec.calculate(
-                            abs(rebalanced_shares - holding.shares), holding.price)
+                        holding.change(rebalanced_shares, commission_spec)
 
-        total_rebalanced_value += holding.value if holding.rebalanced_value is None else holding.rebalanced_value
+        total_value += holding.value
 
-    return total_rebalanced_value, total_commissions
+    return total_value
+
+
+def calculate_total_commissions(holdings: List[Holding]):
+    commissions = 0
+
+    for holding in holdings:
+        if holding.is_group:
+            commissions += calculate_total_commissions(holding.holdings)
+        else:
+            commissions += holding.commission
+
+    return commissions
+
+# FIXME
+# def distribute_free_assets(holdings: List[Holding], expected_total_value, free_assets, commission_spec: CommissionSpec):
+#     total_commissions = 0
+#
+#     for holding in sorted(holdings,
+#         key=lambda holding: get_difference_from_expected(holding, expected_total_value * holding.weight),
+#         reverse=True
+#     ):
+#         if free_assets <= 0:
+#             return
+#
+#         expected_value = expected_total_value * holding.weight
+#
+#         if holding.is_group:
+#             free_assets, commissions = distribute_free_assets(
+#                 holding.holdings, expected_value, free_assets, commission_spec)
+#             total_commissions += commissions
+#         else:
+#             if holding.rebalanced_shares is None:
+#                 current_shares = holding.shares
+#                 current_value = holding.value
+#             else:
+#                 current_shares = holding.rebalanced_shares
+#                 current_value = holding.rebalanced_value
+#
+#             if current_value < expected_value:
+#                 extra_shares = free_assets // holding.price
+#
+#                 if extra_shares > 0:
+#                     commissions = commission_spec.calculate(extra_shares, holding.price)
+#                     extra_shares = (free_assets - commissions) // holding.price
+#
+#                 if extra_shares > 0:
+#                     holding.rebalanced_shares = current_shares + extra_shares
+#                     holding.rebalanced_value = current_value + extra_shares * holding.price
+#                     total_commissions += commission_spec.calculate(extra_shares, holding.price)
+#
+#     return free_assets, total_commissions
+#
+#
+# def get_difference_from_expected(holding: Holding, expected_value):
+#     current_value = holding.value if holding.rebalanced_value is None else holding.rebalanced_value
+#     difference = (expected_value - current_value) / expected_value
+#     return difference
 
 
 def show(action, portfolio: Portfolio, holdings: List[Holding], expected_total_value, *, depth=0):
@@ -365,34 +434,34 @@ def show(action, portfolio: Portfolio, holdings: List[Holding], expected_total_v
             title += " -"
 
             if not holding.is_group:
-                title += " " + format_shares(holding.shares)
+                title += " " + format_shares(holding.current_shares)
 
-            current_weight = get_weight(expected_total_value, holding.value)
-            title += " {weight} ({value})".format(
-                weight=format_weight(current_weight), value=format_assets(holding.value, portfolio.currency))
+            current_weight = get_weight(expected_total_value, holding.current_value)
+            title += " {current_weight} ({current_value})".format(
+                current_weight=format_weight(current_weight),
+                current_value=format_assets(holding.current_value, portfolio.currency))
 
-            if holding.rebalanced_value is not None:
-                if holding.rebalanced_shares is not None:
-                    shares_change = holding.rebalanced_shares - holding.shares
-                    title += " {shares} ({value})".format(
-                        shares=format_shares(shares_change, sign=True),
-                        value=abs(shares_change) * holding.price)
+            if holding.value != holding.current_value:
+                if not holding.is_group:
+                    title += " {shares_change} ({value_change})".format(
+                        shares_change=format_shares(holding.shares - holding.current_shares, sign=True),
+                        value_change=abs(holding.value - holding.current_value))
 
-                rebalanced_weight = get_weight(expected_total_value, holding.rebalanced_value)
-                title += " → {weight} ({value})".format(
-                    weight=format_weight(rebalanced_weight),
-                    value=format_assets(holding.rebalanced_value, portfolio.currency))
+                title += " → {result_weight} ({result_value})".format(
+                    result_weight=format_weight(get_weight(expected_total_value, holding.value)),
+                    result_value=format_assets(holding.value, portfolio.currency))
 
-        title += " {delimiter} {weight} ({value})".format(
+        title += " {delimiter} {expected_weight} ({expected_value})".format(
             delimiter="-" if action == Actions.SHOW else "/",
-            weight=format_weight(holding.expected_weight),
-            value=format_assets(expected_total_value * holding.expected_weight, portfolio.currency))
+            expected_weight=format_weight(holding.expected_weight),
+            expected_value=format_assets(expected_total_value * holding.expected_weight, portfolio.currency))
 
-        if holding.holdings:
+        if holding.is_group:
             title += ":"
 
         print(title)
-        show(action, portfolio, holding.holdings, expected_value, depth=depth + 1)
+        if holding.is_group:
+            show(action, portfolio, holding.holdings, expected_value, depth=depth + 1)
 
 
 def get_weight(assets, value):
@@ -498,7 +567,7 @@ def parse_args():
 
 
 def main():
-    portfolios = []
+    portfolios = [ ]
     args = parse_args()
 
     for portfolio_id, portfolio in enumerate(portfolios):
