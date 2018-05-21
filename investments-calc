@@ -169,23 +169,25 @@ def calculate(portfolio: Portfolio, *, fake_prices=False):
     if fake_prices:
         prices = {ticker: Decimal(1) for ticker in tickers}
     else:
-        # FIXME
-        # prices = get_prices(tickers)
-        prices = {'VXUS': Decimal('57.0200'), 'VGT': Decimal('180.8500'), 'MCHI': Decimal('69.1700'), 'BNDX': Decimal('54.3450'), 'IEMG': Decimal('55.8500'), 'VNQI': Decimal('60.7700'), 'VTI': Decimal('140.1950'), 'BND': Decimal('78.5250'), 'IAU': Decimal('12.3950')}
-        prices.update({'FXCN': Decimal('2855'), 'FXIT': Decimal('4227'), 'FXRB': Decimal('1395'), 'FXRL': Decimal('2110'), 'FXUS': Decimal('2996')})
+        prices = get_prices(tickers)
 
     current_value = calculate_current_value(portfolio.holdings, prices)
-    total_value = current_value + portfolio.free_assets
+    total_assets = current_value + portfolio.free_assets
 
     if not fake_prices:
         calculate_restrictions(portfolio.holdings)
-        correct_weights_for_buying_restriction(portfolio.holdings, total_value)  # TODO: Display underuse?
-        correct_weights_for_selling_restriction(portfolio.holdings, total_value)  # TODO: Display overuse?
+        correct_weights_for_buying_restriction(portfolio.holdings, total_assets)  # TODO: Display underuse?
+        correct_weights_for_selling_restriction(portfolio.holdings, total_assets)  # TODO: Display overuse?
 
-    rebalanced_value = rebalance(portfolio.holdings, total_value, portfolio.commission_spec)
+    rebalanced_value = rebalance(portfolio.holdings, total_assets, portfolio.commission_spec)
+    commissions = calculate_total_commissions(portfolio.holdings)
+    free_assets = total_assets - rebalanced_value - commissions
+
+    free_assets = distribute_free_assets(portfolio.holdings, rebalanced_value, free_assets, portfolio.commission_spec)
+    rebalanced_value = sum(holding.value for holding in portfolio.holdings)
     commissions = calculate_total_commissions(portfolio.holdings)
 
-    return rebalanced_value, total_value - rebalanced_value - commissions, commissions
+    return rebalanced_value, free_assets, commissions
 
 
 def calculate_current_value(holdings: List[Holding], prices):
@@ -346,13 +348,13 @@ def rebalance(holdings: List[Holding], expected_total_value, commission_spec: Co
                 rebalanced_shares = expected_value // holding.price
 
                 if rebalanced_shares != holding.current_shares:
-                    commissions = holding.commission_for(rebalanced_shares, commission_spec)
-                    rebalanced_shares = (expected_value - commissions) // holding.price
+                    commission = holding.commission_for(rebalanced_shares, commission_spec)
+                    rebalanced_shares = (expected_value - commission) // holding.price
 
                 if rebalanced_shares != holding.current_shares:
-                    if rebalanced_shares < holding.current_shares and holding.selling_restricted:
+                    if holding.selling_restricted and rebalanced_shares < holding.current_shares:
                         holding.sell_blocked = True
-                    elif rebalanced_shares > holding.current_shares and holding.buying_restricted:
+                    elif holding.buying_restricted and rebalanced_shares > holding.current_shares:
                         holding.buy_blocked = True
                     else:
                         holding.change(rebalanced_shares, commission_spec)
@@ -373,50 +375,41 @@ def calculate_total_commissions(holdings: List[Holding]):
 
     return commissions
 
-# FIXME
-# def distribute_free_assets(holdings: List[Holding], expected_total_value, free_assets, commission_spec: CommissionSpec):
-#     total_commissions = 0
-#
-#     for holding in sorted(holdings,
-#         key=lambda holding: get_difference_from_expected(holding, expected_total_value * holding.weight),
-#         reverse=True
-#     ):
-#         if free_assets <= 0:
-#             return
-#
-#         expected_value = expected_total_value * holding.weight
-#
-#         if holding.is_group:
-#             free_assets, commissions = distribute_free_assets(
-#                 holding.holdings, expected_value, free_assets, commission_spec)
-#             total_commissions += commissions
-#         else:
-#             if holding.rebalanced_shares is None:
-#                 current_shares = holding.shares
-#                 current_value = holding.value
-#             else:
-#                 current_shares = holding.rebalanced_shares
-#                 current_value = holding.rebalanced_value
-#
-#             if current_value < expected_value:
-#                 extra_shares = free_assets // holding.price
-#
-#                 if extra_shares > 0:
-#                     commissions = commission_spec.calculate(extra_shares, holding.price)
-#                     extra_shares = (free_assets - commissions) // holding.price
-#
-#                 if extra_shares > 0:
-#                     holding.rebalanced_shares = current_shares + extra_shares
-#                     holding.rebalanced_value = current_value + extra_shares * holding.price
-#                     total_commissions += commission_spec.calculate(extra_shares, holding.price)
-#
-#     return free_assets, total_commissions
-#
-#
-# def get_difference_from_expected(holding: Holding, expected_value):
-#     current_value = holding.value if holding.rebalanced_value is None else holding.rebalanced_value
-#     difference = (expected_value - current_value) / expected_value
-#     return difference
+
+def distribute_free_assets(holdings: List[Holding], expected_total_value, free_assets, commission_spec: CommissionSpec):
+    def difference_from_expected(holding: Holding):
+        expected_value = expected_total_value * holding.weight
+        return (expected_value - holding.value) / expected_value
+
+    for holding in sorted(holdings, key=difference_from_expected, reverse=True):
+        if free_assets <= 0:
+            return free_assets
+
+        expected_value = expected_total_value * holding.weight
+
+        if holding.is_group:
+            free_assets = distribute_free_assets(holding.holdings, expected_value, free_assets, commission_spec)
+            holding.value = sum(holding.value for holding in holding.holdings)
+        elif holding.value < expected_value:
+            previous_commission = holding.commission
+            extra_shares = (free_assets + previous_commission) // holding.price
+
+            if extra_shares > 0:
+                commission = commission_spec.calculate(
+                    abs(holding.shares + extra_shares - holding.current_shares), holding.price)
+                extra_shares = (free_assets + previous_commission - commission) // holding.price
+
+            if extra_shares > 0:
+                result_shares = holding.shares + extra_shares
+
+                if not (
+                    holding.selling_restricted and result_shares < holding.current_shares or
+                    holding.buying_restricted and result_shares > holding.current_shares
+                ):
+                    holding.change(result_shares, commission_spec)
+                    free_assets -= extra_shares * holding.price - (holding.commission - previous_commission)
+
+    return free_assets
 
 
 def show(action, portfolio: Portfolio, holdings: List[Holding], expected_total_value, *, depth=0):
@@ -567,7 +560,7 @@ def parse_args():
 
 
 def main():
-    portfolios = [ ]
+    portfolios = []
     args = parse_args()
 
     for portfolio_id, portfolio in enumerate(portfolios):
