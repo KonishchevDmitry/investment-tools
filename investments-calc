@@ -10,6 +10,8 @@ from typing import List
 
 import requests
 
+from termcolor import colored
+
 
 class Actions:
     SHOW = "show"
@@ -59,7 +61,7 @@ class Holding:
         self.ticker = ticker
         self.name = name
 
-        self.expected_weight = Decimal(weight) / 100
+        self.expected_weight = Decimal(weight.rstrip("%")) / 100
         self.weight = self.expected_weight
 
         if self.is_group:
@@ -414,15 +416,15 @@ def distribute_free_assets(holdings: List[Holding], expected_total_value, free_a
 
 def show(action, portfolio: Portfolio, holdings: List[Holding], expected_total_value, *, depth=0):
     for holding in sorted(holdings, key=operator.attrgetter("weight"), reverse=True):
-        title = "{indent}* {name}".format(indent="  " * depth, name=holding.name)
+        title = "{indent}* {name}".format(indent="  " * depth, name=colorify_name(holding.name))
         expected_value = expected_total_value * holding.weight
 
         if action != Actions.SHOW:
             if holding.sell_blocked:
-                title += " [sell blocked]"
+                title += colorify_freeze(" [sell blocked]")
 
             if holding.buy_blocked:
-                title += " [buy blocked]"
+                title += colorify_freeze(" [buy blocked]")
 
             title += " -"
 
@@ -436,16 +438,17 @@ def show(action, portfolio: Portfolio, holdings: List[Holding], expected_total_v
 
             if holding.value != holding.current_value:
                 if not holding.is_group:
-                    title += " {shares_change} ({value_change})".format(
+                    colorify_func = colorify_buy if holding.value > holding.current_value else colorify_sell
+                    title += colorify_func(" {shares_change} ({value_change})".format(
                         shares_change=format_shares(holding.shares - holding.current_shares, sign=True),
-                        value_change=abs(holding.value - holding.current_value))
+                        value_change=format_assets(abs(holding.value - holding.current_value), portfolio.currency)))
 
                 title += " → {result_weight} ({result_value})".format(
                     result_weight=format_weight(get_weight(expected_total_value, holding.value)),
                     result_value=format_assets(holding.value, portfolio.currency))
 
-        title += " {delimiter} {expected_weight} ({expected_value})".format(
-            delimiter="-" if action == Actions.SHOW else "/",
+        title += " " + ("-" if action == Actions.SHOW else "/")
+        title += " {expected_weight} ({expected_value})".format(
             expected_weight=format_weight(holding.expected_weight),
             expected_value=format_assets(expected_total_value * holding.expected_weight, portfolio.currency))
 
@@ -487,6 +490,26 @@ def format_assets(assets, currency):
 
 def format_weight(weight):
     return ("{:.1f}".format(weight * 100).rstrip("0").rstrip(".") or "0") + "%"
+
+
+def colorify_name(string):
+    return colored(string, attrs=["bold"])
+
+
+def colorify_freeze(string):
+    return colored(string, "blue")
+
+
+def colorify_buy(string):
+    return colored(string, "green")
+
+
+def colorify_sell(string):
+    return colored(string, "red")
+
+
+def colorify_weight(string):
+    return colored(string, "magenta", attrs=["bold"])
 
 
 def get_prices(tickers):
@@ -538,7 +561,7 @@ def get_prices(tickers):
 
 
 def process_portfolio(action, portfolio: Portfolio):
-    print(portfolio.name + ":")
+    print(colorify_name(portfolio.name + ":"))
 
     if action == Actions.SHOW:
         calculate(portfolio, fake_prices=True)
@@ -548,9 +571,9 @@ def process_portfolio(action, portfolio: Portfolio):
         show(action, portfolio, portfolio.holdings, total_value)
 
         print()
-        print("Total value: " + format_assets(total_value, portfolio.currency))
-        print("Free assets: " + format_assets(free_assets, portfolio.currency))
-        print("Commissions: " + format_assets(commissions, portfolio.currency))
+        print(colorify_name("Total value: ") + format_assets(total_value, portfolio.currency))
+        print(colorify_name("Free assets: ") + format_assets(free_assets, portfolio.currency))
+        print(colorify_name("Commissions: ") + format_assets(commissions, portfolio.currency))
 
 
 def parse_args():
