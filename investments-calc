@@ -414,6 +414,21 @@ def distribute_free_assets(holdings: List[Holding], expected_total_value, free_a
     return free_assets
 
 
+def flatify(holdings: List[Holding], expected_weight, weight):
+    flat_holdings = []
+
+    for holding in holdings:
+        holding.expected_weight *= expected_weight
+        holding.weight *= weight
+
+        if holding.is_group:
+            flat_holdings.extend(flatify(holding.holdings, holding.expected_weight, holding.weight))
+        else:
+            flat_holdings.append(holding)
+
+    return flat_holdings
+
+
 def show(action, portfolio: Portfolio, holdings: List[Holding], expected_total_value, *, depth=0):
     for holding in sorted(holdings, key=operator.attrgetter("weight"), reverse=True):
         title = "{indent}* {name}".format(indent="  " * depth, name=colorify_name(holding.name))
@@ -560,16 +575,20 @@ def get_prices(tickers):
     return prices
 
 
-def process_portfolio(action, portfolio: Portfolio):
+def process_portfolio(action, portfolio: Portfolio, flat_view):
     print(colorify_name(portfolio.name + ":"))
 
+    total_value, free_assets, commissions = calculate(portfolio, fake_prices=action == Actions.SHOW)
     if action == Actions.SHOW:
-        calculate(portfolio, fake_prices=True)
-        show(action, portfolio, portfolio.holdings, portfolio.free_assets)
-    else:
-        total_value, free_assets, commissions = calculate(portfolio)
-        show(action, portfolio, portfolio.holdings, total_value)
+        total_value, free_assets, commissions = portfolio.free_assets, 0, 0
 
+    if flat_view:
+        portfolio.holdings = flatify(portfolio.holdings, Decimal(1), Decimal(1))
+        portfolio.holdings.sort(key=lambda holding: holding.value, reverse=True)
+
+    show(action, portfolio, portfolio.holdings, total_value)
+
+    if action == Actions.REBALANCE:
         print()
         print(colorify_name("Total value: ") + format_assets(total_value, portfolio.currency))
         print(colorify_name("Free assets: ") + format_assets(free_assets, portfolio.currency))
@@ -579,6 +598,7 @@ def process_portfolio(action, portfolio: Portfolio):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=Actions.ALL, help="action to process")
+    parser.add_argument("--flat", action="store_true", help="flat view")
     return parser.parse_args()
 
 
@@ -590,7 +610,7 @@ def main():
         if portfolio_id:
             print("\n")
 
-        process_portfolio(args.action, portfolio)
+        process_portfolio(args.action, portfolio, args.flat)
 
 
 if __name__ == "__main__":
