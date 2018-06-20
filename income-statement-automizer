@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+
+# FIXME: HERE
+"""Income statement filling automizer"""
+
+import argparse
+import copy
+import datetime
+import itertools
+
+from decimal import Decimal
+from typing import List
+
+import requests
+import xmltodict
+
+from namedlist import namedlist
+
+YEAR = 2017
+
+try:
+    assert False
+except AssertionError:
+    pass
+
+
+class Error(Exception):
+    def __init__(self, *args):
+        message, args = args[0], args[1:]
+        super().__init__(message.format(*args) if args else message)
+
+
+class LogicalError(Error):
+    def __init__(self):
+        super().__init__("Logical error.")
+
+
+class CurrencyRates:
+    def __init__(self):
+        self.__rates = {}
+
+        url = "http://www.cbr.ru/scripts/XML_dynamic.asp?date_req1=31/12/2016&date_req2=31/12/2017&VAL_NM_RQ=R01235"
+
+        for record in xmltodict.parse(requests.get(url).text)["ValCurs"]["Record"]:
+            date = datetime.datetime.strptime(record["@Date"], "%d.%m.%Y").date()
+            value = Decimal(record["Value"].replace(",", "."))
+            self.__rates[date] = value
+
+    def get(self, date):
+        min_date = datetime.date(2016, 12, 31)
+
+        while True:
+            try:
+                return self.__rates[date]
+            except KeyError:
+                if date <= min_date:
+                    raise
+
+                date = date - datetime.timedelta(days=1)
+
+
+currency_rates = CurrencyRates()
+
+
+class Statement:
+    def __init__(self, records):
+        self.__records = records
+
+    def dump(self):
+        for record in self.__records:
+            print(record)
+
+    def add_dividends(self):
+        income = self.__get_dividend_template()
+
+        income.income_name = "test"
+        income.income_date = income.tax_payment_date = datetime.date(YEAR, 5, 5)
+
+        income.currency_rate_for_income_date = currency_rates.get(income.income_date) * 100
+        income.currency_rate_units_for_income_date = 100
+        income.income_value = Decimal(123)
+        income.income_value_in_local_currency = income.income_value * income.currency_rate_for_income_date
+
+        income.currency_rate_for_tax_payment_date = currency_rates.get(income.tax_payment_date) * 100
+        income.currency_rate_units_for_tax_payment_date = 100
+        income.paid_tax_value = income.income_value / 10
+        income.paid_tax_value_in_local_currency = income.paid_tax_value * income.currency_rate_for_tax_payment_date
+
+        self.__add_foreign_income(income)
+
+    def __add_foreign_income(self, income: "ForeignIncome"):
+        incomes = self.get_foreign_incomes()
+        incomes.append(income)
+        self.set_foreign_incomes(incomes)
+
+    def __get_dividend_template(self):
+        template = self.__get_foreign_income_template("dividend")
+
+        assert template.income_type == "1010"
+        assert template.income_type_name == "Дивиденды"
+
+        return template
+
+    def __get_foreign_income_template(self, name):
+        for income in self.get_foreign_incomes():
+            if income.income_name == name:
+                for date in (income.income_date, income.tax_payment_date):
+                    assert date == datetime.date(YEAR, 1, 1)
+
+                break
+        else:
+            raise Error("Unable to find {!r} income in the statement.")
+
+        template = income
+
+        assert template.county_code == "840"
+        assert template.currency_code == "840"
+        assert template.currency_name == "Доллар сша"
+
+        assert template.automatic_currency_converting == "1"
+        assert template.currency_rate_for_income_date == currency_rates.get(template.income_date) * 100
+        assert template.currency_rate_units_for_income_date == 100
+        assert template.currency_rate_for_tax_payment_date == currency_rates.get(template.tax_payment_date) * 100
+        assert template.currency_rate_units_for_tax_payment_date == 100
+
+        return template
+
+    def get_foreign_incomes(self):
+        return [
+            ForeignIncome(self.__get_record("CurrencyIncome{:03d}".format(income_id)))
+            for income_id in range(int(self.__get_record("DeclForeign").data[0]))
+        ]
+
+    def set_foreign_incomes(self, incomes: List["ForeignIncome"]):
+        record_id = self.__get_record_id("DeclForeign")
+
+        record = self.__records[record_id]
+        incomes_number = int(record.data[0])
+        record.data[0] = str(len(incomes))
+
+        self.__records[record_id:record_id + incomes_number + 1] = [record] + [
+            income.to_record(income_id)
+            for income_id, income in enumerate(incomes)
+        ]
+
+    def __get_record(self, record_type):
+        return self.__records[self.__get_record_id(record_type)]
+
+    def __get_record_id(self, record_type):
+        found_id = None
+
+        for record_id, record in enumerate(self.__records):
+            if record.type != record_type:
+                continue
+
+            if found_id is not None:
+                raise Error("There are multiple {!r} records.", record_type)
+
+            found_id = record_id
+
+        if found_id is None:
+            raise Error("Unable to find {!r} record.", record_type)
+
+        return found_id
+
+    def render(self):
+        return "".join(itertools.chain(
+            [StatementParser.header],
+            (self.__render_record(record) for record in self.__records),
+            [StatementParser.footer],
+        ))
+
+    @classmethod
+    def __render_record(cls, record: "Record"):
+        return cls.__render_data("@" + record.type) + "".join(cls.__render_data(data) for data in record.data)
+
+    @staticmethod
+    def __render_data(data):
+        return "{:04d}{}".format(len(data), data)
+
+
+class Record:
+    def __init__(self, type):
+        self.type = type
+        self.data = []
+
+    def add_data(self, data):
+        self.data.append(data)
+
+    def __repr__(self):
+        return "<{}>({})".format(self.type, ", ".join(self.data))
+
+
+def record_view(record_type, fields):
+    class RecordView(namedlist(record_type, fields)):
+        def __init__(self, record: Record):
+            super().__init__(*record.data)
+            self.__convert_values(self._date_values, _parse_date)
+            self.__convert_values(self._currency_values, Decimal)
+
+        def to_record(self, record_type=record_type):
+            self_copy = copy.deepcopy(self)
+            self_copy.__convert_values(self._date_values, _render_date)
+            self_copy.__convert_values(self._currency_values, _render_currency)
+
+            record = Record(record_type)
+            for data in self_copy:
+                record.add_data(data)
+
+            return record
+
+        def __convert_values(self, names, converter):
+            for name in names:
+                setattr(self, name, converter(getattr(self, name)))
+
+    return RecordView
+
+
+class ForeignIncome(record_view("ForeignIncome", """
+    unknown1
+    income_type
+    income_type_name
+    income_name
+    county_code
+    income_date
+    tax_payment_date
+    automatic_currency_converting
+    currency_code
+    currency_rate_for_income_date
+    currency_rate_units_for_income_date
+    currency_rate_for_tax_payment_date
+    currency_rate_units_for_tax_payment_date
+    currency_name
+    income_value
+    income_value_in_local_currency
+    paid_tax_value
+    paid_tax_value_in_local_currency
+    deduction_code
+    deduction_value
+    unknown2
+    company_type
+    unknown3
+""")):
+
+    _date_values = ("income_date", "tax_payment_date")
+    _currency_values = (
+        "income_value",
+        "currency_rate_for_income_date",
+        "currency_rate_units_for_income_date",
+        "income_value_in_local_currency",
+
+        "currency_rate_for_tax_payment_date",
+        "currency_rate_units_for_tax_payment_date",
+        "paid_tax_value",
+        "paid_tax_value_in_local_currency",
+    )
+
+    @staticmethod
+    def get_type(id):
+        return "CurrencyIncome{:03d}".format(id)
+
+    def to_record(self, id):
+        return super().to_record(self.get_type(id))
+
+
+def _parse_date(date):
+    return datetime.date(1899, 12, 30) + datetime.timedelta(int(date))
+
+
+def _render_date(date):
+    return str((date - datetime.date(1899, 12, 30)).days)
+
+
+def _render_currency(value: Decimal):
+    return str(Decimal(int(round(Decimal(value), 2) * 100)) / 100)
+
+
+class StatementParser:
+    header = "DLSG            Decl{}0102FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF".format(YEAR)
+    footer = "\0\0"
+
+    def __init__(self, path):
+        with open(path, "rb") as statement_file:
+            data = statement_file.read().decode("cp1251")
+
+        self.__data = data
+        self.__pos = 0
+
+    def parse(self):
+        header = self.__read(len(self.header))
+        if header != self.header:
+            raise Error("Got an unexpected header: {!r}.", header)
+
+        chapters = []
+        chapter = None
+
+        while True:
+            data = self.__read_data()
+
+            if data.startswith("@"):
+                if chapter is not None:
+                    chapters.append(chapter)
+
+                chapter = Record(data[1:])
+            else:
+                if chapter is None:
+                    raise Error("Got an unexpected record: {!r}.", data)
+
+                chapter.add_data(data)
+
+                if chapter.type == "Nalog":
+                    if (
+                        len(chapter.data) == 1 or data == "0" or
+                        self.__read(len(self.footer)) == self.footer or
+                        self.__pos == len(self.__data)
+                    ):
+                        chapters.append(chapter)
+                        break
+
+                    raise Error("Got an unexpected footer.")
+
+        statement = Statement(chapters)
+
+        # FIXME
+        statement.set_foreign_incomes(statement.get_foreign_incomes())
+        if statement.render() != self.__data:
+            raise LogicalError()
+
+        return statement
+
+    def __read_data(self):
+        size = self.__read_data_size()
+        return self.__read(size)
+
+    def __read_data_size(self):
+        pos = self.__pos
+        size = self.__read(4)
+
+        try:
+            size = int(size)
+            if size < 0:
+                raise ValueError
+        except ValueError:
+            raise Error("Got an invalid data size at {}: {!r}.", pos, size)
+
+        return size
+
+    def __read(self, size):
+        pos = self.__pos + size
+
+        data = self.__data[self.__pos:pos]
+        if len(data) != size:
+            raise Error("Got an unexpected end of file.")
+
+        self.__pos = pos
+        return data
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("statement", help="income statement path")
+    parser.add_argument("--dump", action="store_true", help="dump the statement")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    try:
+        statement = StatementParser(args.statement).parse()
+    except Error:
+        raise Error("Failed to parse the income statement file: {}")
+
+    if args.dump:
+        print("Original statement:")
+        statement.dump()
+
+    statement.add_dividends()
+
+    if args.dump:
+        print("\n\nModified statement:")
+        statement.dump()
+
+    data = statement.render().encode("cp1251")
+    with open(args.statement, "wb") as statement_file:
+        statement_file.write(data)
+
+
+if __name__ == "__main__":
+    main()
