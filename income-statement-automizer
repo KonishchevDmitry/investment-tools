@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# requirements.txt: namedlist requests xmltodict
+# requirements.txt: namedlist prettytable requests xmltodict
 
 """Income statement filling automizer"""
 
@@ -18,6 +18,8 @@ import requests
 import xmltodict
 
 from namedlist import namedlist
+
+from prettytable import PrettyTable
 
 T = TypeVar("T")
 
@@ -40,37 +42,119 @@ class LogicalError(Exception):
 
 
 class CurrencyRates:
-    def __init__(self, year, *, mock=False):
+    __start_december_day = 30
+
+    def __init__(self, *, mock=False):
         self.mock = mock
-        self.__year = year
-
-        if self.mock:
-            return
-
         self.__rates = {}
-        url = "http://www.cbr.ru/scripts/XML_dynamic.asp?date_req1=31/12/{}&date_req2=31/12/{}&VAL_NM_RQ=R01235".format(
-            year - 1, year)
-
-        for record in xmltodict.parse(requests.get(url).content)["ValCurs"]["Record"]:
-            date = datetime.datetime.strptime(record["@Date"], "%d.%m.%Y").date()
-            value = Decimal(record["Value"].replace(",", "."))
-            self.__rates[date] = value
 
     def get(self, date):
         if self.mock:
             return Decimal()
 
         cur_date = date
-        min_date = datetime.date(self.__year - 1, 12, 31)
+        min_date = datetime.date(date.year - 1, 12, self.__start_december_day)
+        rates = self.__get_rates(date.year)
 
         while True:
             try:
-                return self.__rates[cur_date]
+                return rates[cur_date]
             except KeyError:
                 if cur_date <= min_date:
+                    print(rates)
                     raise Error("Unable to find currency rates for {}.", date)
 
                 cur_date = cur_date - datetime.timedelta(days=1)
+
+    def __get_rates(self, year):
+        try:
+            return self.__rates[year]
+        except KeyError:
+            pass
+
+        rates = {}
+        url = "http://www.cbr.ru/scripts/XML_dynamic.asp?date_req1={}/12/{}&date_req2=31/12/{}&VAL_NM_RQ=R01235".format(
+            self.__start_december_day, year - 1, year)
+
+        for record in xmltodict.parse(requests.get(url).content)["ValCurs"]["Record"]:
+            date = datetime.datetime.strptime(record["@Date"], "%d.%m.%Y").date()
+            value = Decimal(record["Value"].replace(",", "."))
+            rates[date] = value
+
+        self.__rates[year] = rates
+
+        return rates
+
+
+class Dividend:
+    def __init__(self, date, issuer, value, paid_taxes=None):
+        self.date = date
+        self.issuer = issuer
+        self.paid_taxes = paid_taxes or Decimal()
+        self.value = value + self.paid_taxes
+
+    def calculate(self, currency_rates: CurrencyRates):
+        self.local_currency_rate = currency_rates.get(self.date)
+        self.value_in_local_currency = _round_currency(self.value * self.local_currency_rate)
+        self.paid_taxes_in_local_currency = _round_currency(self.paid_taxes * self.local_currency_rate)
+        return self
+
+
+class BrokerageIncome:
+    def __init__(self, broker_name, currency_rates: CurrencyRates, dividends=None):
+        self.broker_name = broker_name
+        self.dividends = [dividend.calculate(currency_rates) for dividend in dividends or []]
+        self.__currency_rates = currency_rates
+
+    def print(self):
+        print("Расчет дохода от дивидендов, полученных через " + self.broker_name)
+
+        currency_columns = [
+            "Сумма (USD)", "Курс руб.", "Сумма (руб)",
+            "Уплаченный налог (USD)", "Упалаченный налог (руб)", "К доплате (руб)", "Реальный доход",
+        ]
+
+        table = PrettyTable(["Дата", "Эмитент", "Валюта"] + currency_columns)
+
+        for column_name in currency_columns:
+            table.align[column_name] = "r"
+
+        total_value = Decimal()
+        total_value_in_local_currency = Decimal()
+
+        total_paid_taxes = Decimal()
+        total_paid_taxes_in_local_currency = Decimal()
+
+        total_to_pay = Decimal()
+        total_real_income = Decimal()
+
+        for dividend in self.dividends:
+            expected_taxes_in_local_currency = _round_currency(dividend.value_in_local_currency * Decimal("0.13"))
+            to_pay = max(Decimal(), expected_taxes_in_local_currency - dividend.paid_taxes_in_local_currency)
+            real_income = dividend.value_in_local_currency - dividend.paid_taxes_in_local_currency - to_pay
+
+            total_value += dividend.value
+            total_value_in_local_currency += dividend.value_in_local_currency
+
+            total_paid_taxes += dividend.paid_taxes
+            total_paid_taxes_in_local_currency += dividend.paid_taxes_in_local_currency
+
+            total_to_pay += to_pay
+            total_real_income += real_income
+
+            table.add_row((
+                dividend.date.strftime("%d.%m.%Y"), dividend.issuer, "USD",
+                dividend.value, dividend.local_currency_rate, dividend.value_in_local_currency,
+                dividend.paid_taxes, dividend.paid_taxes_in_local_currency, to_pay, real_income,
+            ))
+
+        table.add_row((
+            "", "", "",
+            total_value, "", total_value_in_local_currency,
+            total_paid_taxes, total_paid_taxes_in_local_currency, total_to_pay, total_real_income,
+        ))
+
+        print(table.get_string())
 
 
 class Record:
@@ -183,13 +267,18 @@ class Date:
 class Currency:
     @staticmethod
     def encode(value: Decimal):
-        rounded_value = round(Decimal(value), 2)
-        stripped_value = Decimal(int(rounded_value * 100)) / 100
-        return str(stripped_value)
+        rounded_value = _round_currency(value)
+        assert rounded_value == value
+        return str(rounded_value)
 
     @staticmethod
     def decode(string):
         return Decimal(string)
+
+
+def _round_currency(value):
+    rounded_value = round(Decimal(value), 2)
+    return Decimal(int(rounded_value * 100)) / 100
 
 
 class ForeignIncomeStatement(record_view("DeclForeign", (("incomes", Integer),))):
@@ -238,24 +327,26 @@ class Statement:
         self.__set_foreign_incomes(self.__get_foreign_incomes())
         return self
 
-    # FIXME
-    def add_dividends(self):
-        income = self.__get_dividend_template()
+    def add_income(self, brokerage_income: BrokerageIncome):
+        for dividend in brokerage_income.dividends:
+            income = self.__get_dividend_template()
 
-        income.income_name = "test"
-        income.income_date = income.tax_payment_date = datetime.date(self.__year, 5, 5)
+            income.income_name = "{}: Дивиденд от {}".format(brokerage_income.broker_name, dividend.issuer)
+            income.income_date = income.tax_payment_date = dividend.date
 
-        income.currency_rate_for_income_date = self.__currency_rates.get(income.income_date) * 100
-        income.currency_rate_units_for_income_date = 100
-        income.income_value = Decimal(123)
-        income.income_value_in_local_currency = income.income_value * income.currency_rate_for_income_date
+            assert dividend.local_currency_rate.as_tuple().exponent == -4
+            income.currency_rate_for_income_date = dividend.local_currency_rate * 100
+            income.currency_rate_units_for_income_date = 100
+            income.income_value = dividend.value
+            income.income_value_in_local_currency = dividend.value_in_local_currency
 
-        income.currency_rate_for_tax_payment_date = self.__currency_rates.get(income.tax_payment_date) * 100
-        income.currency_rate_units_for_tax_payment_date = 100
-        income.paid_tax_value = income.income_value / 10
-        income.paid_tax_value_in_local_currency = income.paid_tax_value * income.currency_rate_for_tax_payment_date
+            assert dividend.local_currency_rate.as_tuple().exponent == -4
+            income.currency_rate_for_tax_payment_date = dividend.local_currency_rate * 100
+            income.currency_rate_units_for_tax_payment_date = 100
+            income.paid_tax_value = dividend.paid_taxes
+            income.paid_tax_value_in_local_currency = dividend.paid_taxes_in_local_currency
 
-        self.__add_foreign_income(income)
+            self.__add_foreign_income(income)
 
     def __get_dividend_template(self):
         template = self.__get_foreign_income_template("dividend")
@@ -426,7 +517,7 @@ def _encode_data(data):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("statement", help="income statement path")
+    parser.add_argument("--statement", metavar="PATH", help="income statement path")
     parser.add_argument("--dump", action="store_true", help="dump the statement")
     parser.add_argument("--mock", action="store_true", help="mock currency rates")
     return parser.parse_args()
@@ -435,41 +526,47 @@ def parse_args():
 def main():
     try:
         args = parse_args()
-        statement_path = args.statement
+        currency_rates = CurrencyRates(mock=args.mock)
 
-        match = re.search(r"\.dc(\d)", statement_path, re.IGNORECASE)
-        if match is None:
-            raise Error("Unsupported income statement file type.")
-        statement_year = 2010 + int(match.group(1))
+        incomes = []
+        for income in incomes:
+            income.print()
 
-        currency_rates = CurrencyRates(statement_year, mock=args.mock)
+        if args.statement is not None:
+            statement_path = args.statement
 
-        parser = StatementParser(statement_year, statement_path, currency_rates)
+            match = re.search(r"\.dc(\d)", statement_path, re.IGNORECASE)
+            if match is None:
+                raise Error("Unsupported income statement file type.")
+            statement_year = 2010 + int(match.group(1))
 
-        try:
-            statement = parser.parse()
-        except Error as e:
-            raise Error("Failed to parse the income statement file: {}", e)
+            parser = StatementParser(statement_year, statement_path, currency_rates)
 
-        if args.dump:
-            print("Original statement:")
-            statement.dump()
+            try:
+                statement = parser.parse()
+            except Error as e:
+                raise Error("Failed to parse the income statement file: {}", e)
 
-        parser.validate(statement)
+            if args.dump:
+                print("Original statement:")
+                statement.dump()
 
-        statement.add_dividends()
+            parser.validate(statement)
 
-        if args.dump:
-            print("\n\nModified statement:")
-            statement.dump()
+            for income in incomes:
+                statement.add_income(income)
 
-        data = parser.encode(statement)
+            if args.dump:
+                print("\n\nModified statement:")
+                statement.dump()
 
-        try:
-            with open(statement_path, "wb") as statement_file:
-                statement_file.write(data)
-        except OSError as e:
-            raise Error("Unable to write {!r}: {}.", statement_path, e.strerror)
+            data = parser.encode(statement)
+
+            try:
+                with open(statement_path, "wb") as statement_file:
+                    statement_file.write(data)
+            except OSError as e:
+                raise Error("Unable to write {!r}: {}.", statement_path, e.strerror)
     except Error as e:
         sys.exit("Error: {}".format(e))
 
