@@ -5,8 +5,10 @@
 """Income statement filling automizer"""
 
 import argparse
+import csv
 import datetime
 import itertools
+import pprint
 import re
 import sys
 
@@ -90,8 +92,8 @@ class Dividend:
     def __init__(self, date, issuer, value, paid_taxes=None):
         self.date = date
         self.issuer = issuer
+        self.value = value
         self.paid_taxes = paid_taxes or Decimal()
-        self.value = value + self.paid_taxes
 
     def calculate(self, currency_rates: CurrencyRates):
         self.local_currency_rate = currency_rates.get(self.date)
@@ -107,11 +109,11 @@ class BrokerageIncome:
         self.__currency_rates = currency_rates
 
     def print(self):
-        print("Расчет дохода от дивидендов, полученных через " + self.broker_name)
+        print("\nРасчет дохода от дивидендов, полученных через " + self.broker_name)
 
         currency_columns = [
             "Сумма (USD)", "Курс руб.", "Сумма (руб)",
-            "Уплаченный налог (USD)", "Упалаченный налог (руб)", "К доплате (руб)", "Реальный доход",
+            "Уплачено (USD)", "Уплачено (руб)", "К доплате (руб)", "Реальный доход",
         ]
 
         table = PrettyTable(["Дата", "Эмитент", "Валюта"] + currency_columns)
@@ -515,9 +517,90 @@ def _encode_data(data):
     return "{:04d}{}".format(len(data), data)
 
 
+class IbBlock:
+    def __init__(self, name, columns):
+        self.name = name
+        self.columns = columns
+        self.data = []
+
+
+def parse_ib_statement(path, currency_rates: CurrencyRates):
+    statement = {}
+    current_block = None
+
+    try:
+        with open(path) as statement_file:
+            for line_id, line in enumerate(csv.reader(statement_file)):
+                if line_id == 0 and line:
+                    line[0] = line[0].lstrip("\ufeff")
+
+                try:
+                    block_name, data_type, *data = line
+                except ValueError:
+                    raise Error("Got an unexpected data: {!r}.", line)
+
+                if data_type == "Header":
+                    current_block = IbBlock(block_name, data)
+
+                    if block_name in statement:
+                        current_block.data = statement[block_name]
+                    else:
+                        statement[block_name] = current_block.data
+                elif data_type == "Data":
+                    if current_block is None or block_name != current_block.name:
+                        raise Error("Got an unexpected data without block headers: {!r}.", line)
+
+                    # This block is badly formatted, skipping it
+                    if block_name == "Codes":
+                        continue
+
+                    current_block.data.append(dict(_safe_zip(current_block.columns, data)))
+                elif data_type == "Total":
+                    current_block = None
+                else:
+                    raise Error("Got an unexpected data: {!r}.", line)
+    except (OSError, ValueError) as e:
+        raise Error("Error while reading {!r}: {}.", path, e)
+    except Error as e:
+        raise Error("Error while reading {!r}: {}", path, e)
+
+    tickers = {
+        ticker_info["Symbol"]: ticker_info["Description"]
+        for ticker_info in statement["Financial Instrument Information"]}
+
+    dividends = []
+
+    for dividend_info in statement["Change in Dividend Accruals"]:
+        if dividend_info["Asset Category"] in (
+            "Starting Dividend Accruals in USD",
+            "Total",
+            "Ending Dividend Accruals in USD",
+        ):
+            continue
+
+        assert dividend_info["Asset Category"] == "Stocks"
+        assert dividend_info["Currency"] == "USD"
+        assert dividend_info["Date"] == dividend_info["Pay Date"]
+        assert dividend_info["Fee"] == "0"
+
+        date = datetime.datetime.strptime(dividend_info["Date"], "%Y-%m-%d").date()
+        issuer = "{} ({})".format(tickers[dividend_info["Symbol"]], dividend_info["Symbol"])
+
+        value = -Decimal(dividend_info["Gross Amount"])
+        assert value > 0
+
+        paid_taxes = -Decimal(dividend_info["Tax"])
+        assert paid_taxes > 0
+
+        dividends.append(Dividend(date, issuer, value, paid_taxes=paid_taxes))
+
+    return BrokerageIncome("Interactive Brokers", currency_rates, dividends=dividends)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--statement", metavar="PATH", help="income statement path")
+    parser.add_argument("--ib-statement", metavar="PATH", help="Interactive Brokers statement path")
+    parser.add_argument("--income-statement", metavar="PATH", help="income statement path")
     parser.add_argument("--dump", action="store_true", help="dump the statement")
     parser.add_argument("--mock", action="store_true", help="mock currency rates")
     return parser.parse_args()
@@ -529,11 +612,14 @@ def main():
         currency_rates = CurrencyRates(mock=args.mock)
 
         incomes = []
+        if args.ib_statement is not None:
+            incomes.append(parse_ib_statement(args.ib_statement, currency_rates))
+
         for income in incomes:
             income.print()
 
-        if args.statement is not None:
-            statement_path = args.statement
+        if args.income_statement is not None:
+            statement_path = args.income_statement
 
             match = re.search(r"\.dc(\d)", statement_path, re.IGNORECASE)
             if match is None:
@@ -548,7 +634,7 @@ def main():
                 raise Error("Failed to parse the income statement file: {}", e)
 
             if args.dump:
-                print("Original statement:")
+                print("\n\nOriginal statement:")
                 statement.dump()
 
             parser.validate(statement)
