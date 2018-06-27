@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+#
+# requirements.txt: requests termcolor
 
 """Investments distribution calculator"""
 
@@ -114,12 +116,15 @@ class Holding:
 
 
 class Portfolio:
-    def __init__(self, name, currency, commission_spec: CommissionSpec, *, holdings: List[Holding], free_assets):
+    def __init__(self, name, currency, commission_spec: CommissionSpec, *, holdings: List[Holding], free_assets,
+                 min_free_assets, min_trade_volume=0):
         self.name = name
         self.currency = currency
         self.commission_spec = commission_spec
         self.holdings = holdings
         self.free_assets = Decimal(free_assets)
+        self.min_free_assets = Decimal(min_free_assets)
+        self.min_trade_volume = Decimal(min_trade_volume)
 
     def restrict_selling(self, restrict=True):
         apply_restriction(self.holdings, "selling_restricted", restrict)
@@ -175,17 +180,20 @@ def calculate(portfolio: Portfolio, *, fake_prices=False):
 
     current_value = calculate_current_value(portfolio.holdings, prices)
     total_assets = current_value + portfolio.free_assets
+    rebalance_to = total_assets - portfolio.min_free_assets
 
     if not fake_prices:
         calculate_restrictions(portfolio.holdings)
-        correct_weights_for_buying_restriction(portfolio.holdings, total_assets)  # TODO: Display underuse?
-        correct_weights_for_selling_restriction(portfolio.holdings, total_assets)  # TODO: Display overuse?
+        correct_weights_for_buying_restriction(portfolio.holdings, rebalance_to)  # TODO: Display underuse?
+        correct_weights_for_selling_restriction(portfolio.holdings, rebalance_to)  # TODO: Display overuse?
 
-    rebalanced_value = rebalance(portfolio.holdings, total_assets, portfolio.commission_spec)
+    rebalanced_value = rebalance(portfolio.holdings, rebalance_to, portfolio.commission_spec, portfolio.min_trade_volume)
     commissions = calculate_total_commissions(portfolio.holdings)
     free_assets = total_assets - rebalanced_value - commissions
 
-    free_assets = distribute_free_assets(portfolio.holdings, rebalanced_value, free_assets, portfolio.commission_spec)
+    free_assets = distribute_free_assets(
+        portfolio.holdings, rebalanced_value, free_assets - portfolio.min_free_assets,
+        portfolio.commission_spec, portfolio.min_trade_volume)
     rebalanced_value = sum(holding.value for holding in portfolio.holdings)
     commissions = calculate_total_commissions(portfolio.holdings)
 
@@ -332,14 +340,14 @@ def correct_weights_for_buying_restriction(holdings: List[Holding], expected_tot
         return succeeded
 
 
-def rebalance(holdings: List[Holding], expected_total_value, commission_spec: CommissionSpec):
+def rebalance(holdings: List[Holding], expected_total_value, commission_spec: CommissionSpec, min_trade_volume):
     total_value = Decimal()
 
     for holding in holdings:
         expected_value = expected_total_value * holding.weight
 
         if holding.is_group:
-            holding.value = rebalance(holding.holdings, expected_value, commission_spec)
+            holding.value = rebalance(holding.holdings, expected_value, commission_spec, min_trade_volume)
         else:
             if holding.shares != holding.current_shares:
                 raise LogicalError()
@@ -354,10 +362,15 @@ def rebalance(holdings: List[Holding], expected_total_value, commission_spec: Co
                     rebalanced_shares = (expected_value - commission) // holding.price
 
                 if rebalanced_shares != holding.current_shares:
-                    if holding.selling_restricted and rebalanced_shares < holding.current_shares:
+                    if rebalanced_shares < holding.current_shares and holding.selling_restricted:
                         holding.sell_blocked = True
-                    elif holding.buying_restricted and rebalanced_shares > holding.current_shares:
+                    elif rebalanced_shares > holding.current_shares and holding.buying_restricted:
                         holding.buy_blocked = True
+                    elif abs(rebalanced_shares - holding.current_shares) * holding.price < min_trade_volume:
+                        if rebalanced_shares < holding.current_shares:
+                            holding.sell_blocked = True
+                        else:
+                            holding.buy_blocked = True
                     else:
                         holding.change(rebalanced_shares, commission_spec)
 
@@ -378,7 +391,9 @@ def calculate_total_commissions(holdings: List[Holding]):
     return commissions
 
 
-def distribute_free_assets(holdings: List[Holding], expected_total_value, free_assets, commission_spec: CommissionSpec):
+def distribute_free_assets(
+    holdings: List[Holding], expected_total_value, free_assets, commission_spec: CommissionSpec, min_trade_volume
+):
     def difference_from_expected(holding: Holding):
         expected_value = expected_total_value * holding.weight
         return (expected_value - holding.value) / expected_value
@@ -390,7 +405,8 @@ def distribute_free_assets(holdings: List[Holding], expected_total_value, free_a
         expected_value = expected_total_value * holding.weight
 
         if holding.is_group:
-            free_assets = distribute_free_assets(holding.holdings, expected_value, free_assets, commission_spec)
+            free_assets = distribute_free_assets(
+                holding.holdings, expected_value, free_assets, commission_spec, min_trade_volume)
             holding.value = sum(holding.value for holding in holding.holdings)
         elif holding.value < expected_value:
             previous_commission = holding.commission
@@ -405,8 +421,9 @@ def distribute_free_assets(holdings: List[Holding], expected_total_value, free_a
                 result_shares = holding.shares + extra_shares
 
                 if not (
-                    holding.selling_restricted and result_shares < holding.current_shares or
-                    holding.buying_restricted and result_shares > holding.current_shares
+                    result_shares < holding.current_shares and holding.selling_restricted or
+                    result_shares > holding.current_shares and holding.buying_restricted or
+                    abs(result_shares - holding.current_shares) * holding.price < min_trade_volume
                 ):
                     holding.change(result_shares, commission_spec)
                     free_assets -= extra_shares * holding.price - (holding.commission - previous_commission)
@@ -551,6 +568,7 @@ def get_prices(tickers):
         return prices
 
     # See http://iss.moex.com/iss/reference/
+    # HTML output: https://iss.moex.com/iss/engines/stock/markets/shares/securities?securities=FXMM,FXRB
     response = requests.get("https://iss.moex.com/iss/engines/stock/markets/shares/securities.json", params={
         "securities": ",".join(unknown_tickers),
     })
@@ -561,12 +579,16 @@ def get_prices(tickers):
     columns = market_data["columns"]
     ticker_column_id = columns.index("SECID")
     board_column_id = columns.index("BOARDID")
-    price_column_id = columns.index("LAST")
+    last_price_column_id = columns.index("LAST")
+    last_current_price_column_id = columns.index("LCURRENTPRICE")
 
     for data in market_data["data"]:
         ticker = data[ticker_column_id]
         if ticker in unknown_tickers and data[board_column_id] == "TQTF":
-            prices[ticker] = Decimal(data[price_column_id])
+            price = data[last_price_column_id]
+            if price is None:
+                price = data[last_current_price_column_id]
+            prices[ticker] = Decimal(price)
 
     unknown_tickers = set(tickers) - set(prices)
     if unknown_tickers:
