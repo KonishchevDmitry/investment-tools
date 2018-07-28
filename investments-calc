@@ -193,7 +193,8 @@ def calculate(portfolio: Portfolio, *, fake_prices=False):
 
     free_assets = distribute_free_assets(
         portfolio.holdings, rebalanced_value, free_assets - portfolio.min_free_assets,
-        portfolio.commission_spec, portfolio.min_trade_volume)
+        portfolio.commission_spec, portfolio.min_trade_volume
+    ) + portfolio.min_free_assets
     rebalanced_value = sum(holding.value for holding in portfolio.holdings)
     commissions = calculate_total_commissions(portfolio.holdings)
 
@@ -260,7 +261,7 @@ def correct_weights_for_selling_restriction(holdings: List[Holding], expected_to
             else:
                 correctable_holdings.append(holding)
 
-        if total_assets_overuse:
+        if total_assets_overuse > 0:
             if correctable_holdings:
                 expected_value = Decimal()
                 for holding in correctable_holdings:
@@ -396,7 +397,10 @@ def distribute_free_assets(
 ):
     def difference_from_expected(holding: Holding):
         expected_value = expected_total_value * holding.weight
-        return (expected_value - holding.value) / expected_value
+        if expected_value == 0:
+            return -holding.value
+        else:
+            return (expected_value - holding.value) / expected_value
 
     for holding in sorted(holdings, key=difference_from_expected, reverse=True):
         if free_assets <= 0:
@@ -544,6 +548,10 @@ def colorify_weight(string):
     return colored(string, "magenta", attrs=["bold"])
 
 
+def colorify_low_free_assets(string):
+    return colored(string, "red")
+
+
 def get_prices(tickers):
     prices = {}
     if not tickers:
@@ -613,7 +621,12 @@ def process_portfolio(action, portfolio: Portfolio, flat_view):
     if action == Actions.REBALANCE:
         print()
         print(colorify_name("Total value: ") + format_assets(total_value, portfolio.currency))
-        print(colorify_name("Free assets: ") + format_assets(free_assets, portfolio.currency))
+
+        formatted_free_assets = format_assets(free_assets, portfolio.currency)
+        if free_assets < portfolio.min_free_assets:
+            formatted_free_assets = colorify_low_free_assets(formatted_free_assets)
+        print(colorify_name("Free assets: ") + formatted_free_assets)
+
         print(colorify_name("Commissions: ") + format_assets(commissions, portfolio.currency))
 
 
