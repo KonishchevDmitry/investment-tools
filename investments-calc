@@ -5,6 +5,7 @@
 """Investments distribution calculator"""
 
 import argparse
+import math
 import operator
 
 from decimal import Decimal
@@ -190,11 +191,20 @@ def calculate(portfolio: Portfolio, *, fake_prices=False):
     rebalanced_value = rebalance(portfolio.holdings, rebalance_to, portfolio.commission_spec, portfolio.min_trade_volume)
     commissions = calculate_total_commissions(portfolio.holdings)
     free_assets = total_assets - rebalanced_value - commissions
+    free_assets_to_distribute = free_assets - portfolio.min_free_assets
 
-    free_assets = distribute_free_assets(
-        portfolio.holdings, rebalanced_value, free_assets - portfolio.min_free_assets,
-        portfolio.commission_spec, portfolio.min_trade_volume
-    ) + portfolio.min_free_assets
+    for underfunded_only in (True, False):
+        while free_assets_to_distribute > 0:
+            free_assets_after_distribution = distribute_free_assets(
+                portfolio.holdings, rebalanced_value, free_assets_to_distribute,
+                portfolio.commission_spec, portfolio.min_trade_volume, underfunded_only)
+
+            if free_assets_after_distribution == free_assets_to_distribute:
+                break
+
+            free_assets_to_distribute = free_assets_after_distribution
+
+    free_assets = free_assets_to_distribute + portfolio.min_free_assets
     rebalanced_value = sum(holding.value for holding in portfolio.holdings)
     commissions = calculate_total_commissions(portfolio.holdings)
 
@@ -242,7 +252,7 @@ def calculate_restrictions(holdings: List[Holding]):
             maximum_values.append(holding.maximum_value)
 
     if len(maximum_values) == len(holdings):
-        total_maximum_value = sum(holdings)
+        total_maximum_value = sum(maximum_values)
 
     return total_minimum_value, total_maximum_value
 
@@ -393,7 +403,8 @@ def calculate_total_commissions(holdings: List[Holding]):
 
 
 def distribute_free_assets(
-    holdings: List[Holding], expected_total_value, free_assets, commission_spec: CommissionSpec, min_trade_volume
+    holdings: List[Holding], expected_total_value, free_assets, commission_spec: CommissionSpec, min_trade_volume,
+    underfunded_only
 ):
     def difference_from_expected(holding: Holding):
         expected_value = expected_total_value * holding.weight
@@ -410,16 +421,18 @@ def distribute_free_assets(
 
         if holding.is_group:
             free_assets = distribute_free_assets(
-                holding.holdings, expected_value, free_assets, commission_spec, min_trade_volume)
+                holding.holdings, expected_value, free_assets, commission_spec, min_trade_volume, underfunded_only)
             holding.value = sum(holding.value for holding in holding.holdings)
-        elif holding.value < expected_value:
+        elif not underfunded_only or holding.value < expected_value:
             previous_commission = holding.commission
             extra_shares = (free_assets + previous_commission) // holding.price
+            extra_shares = limit_extra_shares_to_minimum(holding, extra_shares, min_trade_volume)
 
             if extra_shares > 0:
                 commission = commission_spec.calculate(
                     abs(holding.shares + extra_shares - holding.current_shares), holding.price)
                 extra_shares = (free_assets + previous_commission - commission) // holding.price
+                extra_shares = limit_extra_shares_to_minimum(holding, extra_shares, min_trade_volume)
 
             if extra_shares > 0:
                 result_shares = holding.shares + extra_shares
@@ -433,6 +446,17 @@ def distribute_free_assets(
                     free_assets -= extra_shares * holding.price - (holding.commission - previous_commission)
 
     return free_assets
+
+
+def limit_extra_shares_to_minimum(holding: Holding, extra_shares, min_trade_volume):
+    min_trade_shares = math.ceil(min_trade_volume / holding.price)
+
+    min_extra_shares = min_trade_shares
+    if holding.shares > holding.current_shares:
+        min_extra_shares -= holding.shares - holding.current_shares
+    min_extra_shares = max(1, min_extra_shares)
+
+    return min(extra_shares, min_extra_shares)
 
 
 def flatify(holdings: List[Holding], expected_weight, weight):
