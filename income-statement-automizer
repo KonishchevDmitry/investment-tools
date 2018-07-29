@@ -8,7 +8,6 @@ import argparse
 import csv
 import datetime
 import itertools
-import pprint
 import re
 import sys
 
@@ -118,6 +117,7 @@ class BrokerageIncome:
 
         table = PrettyTable(["Дата", "Эмитент", "Валюта"] + currency_columns)
 
+        table.align["Эмитент"] = "l"
         for column_name in currency_columns:
             table.align[column_name] = "r"
 
@@ -524,7 +524,7 @@ class IbBlock:
         self.data = []
 
 
-def parse_ib_statement(path, currency_rates: CurrencyRates):
+def parse_ib_statement(path):
     statement = {}
     current_block = None
 
@@ -555,8 +555,9 @@ def parse_ib_statement(path, currency_rates: CurrencyRates):
                         continue
 
                     current_block.data.append(dict(_safe_zip(current_block.columns, data)))
-                elif data_type == "Total":
-                    current_block = None
+                elif data_type in ("Total", "SubTotal"):
+                    if current_block is None or block_name != current_block.name:
+                        raise Error("Got an unexpected {!r} data without block headers: {!r}.", data_type, line)
                 else:
                     raise Error("Got an unexpected data: {!r}.", line)
     except (OSError, ValueError) as e:
@@ -564,37 +565,75 @@ def parse_ib_statement(path, currency_rates: CurrencyRates):
     except Error as e:
         raise Error("Error while reading {!r}: {}", path, e)
 
+    return statement
+
+
+def get_ib_brokerage_income(statement, currency_rates: CurrencyRates):
     tickers = {
         ticker_info["Symbol"]: ticker_info["Description"]
         for ticker_info in statement["Financial Instrument Information"]}
 
+    taxes = {}
+
+    for tax_info in strip_totals_from_ib_records(statement["Withholding Tax"], "Currency"):
+        assert tax_info["Currency"] == "USD"
+
+        date = parse_ib_date(tax_info["Date"])
+        description = tax_info["Description"]
+
+        amount = -Decimal(tax_info["Amount"])
+        assert amount > 0
+
+        key = (date, description)
+        if key in taxes:
+            raise Error("Duplicate tax: {}.", tax_info)
+
+        taxes[key] = amount
+
     dividends = []
+    dividend_description_suffix = " (Ordinary Dividend)"
+    dividend_tax_description_suffix = " - US Tax"
 
-    for dividend_info in statement["Change in Dividend Accruals"]:
-        if dividend_info["Asset Category"] in (
-            "Starting Dividend Accruals in USD",
-            "Total",
-            "Ending Dividend Accruals in USD",
-        ):
-            continue
-
-        assert dividend_info["Asset Category"] == "Stocks"
+    for dividend_info in strip_totals_from_ib_records(statement["Dividends"], "Currency"):
         assert dividend_info["Currency"] == "USD"
-        assert dividend_info["Date"] == dividend_info["Pay Date"]
-        assert dividend_info["Fee"] == "0"
 
-        date = datetime.datetime.strptime(dividend_info["Date"], "%Y-%m-%d").date()
-        issuer = "{} ({})".format(tickers[dividend_info["Symbol"]], dividend_info["Symbol"])
+        date = parse_ib_date(dividend_info["Date"])
 
-        value = -Decimal(dividend_info["Gross Amount"])
-        assert value > 0
+        description = dividend_info["Description"]
+        if not description.endswith(dividend_description_suffix):
+            raise Error("Unexpected dividend description: {!r}.", description)
+        description = description[:-len(dividend_description_suffix)]
 
-        paid_taxes = -Decimal(dividend_info["Tax"])
-        assert paid_taxes > 0
+        ticker = [word for word in re.split(r"\b", description) if word.strip()][0]
+        issuer = "{} ({})".format(tickers[ticker], ticker)
 
-        dividends.append(Dividend(date, issuer, value, paid_taxes=paid_taxes))
+        amount = Decimal(dividend_info["Amount"])
+        assert amount > 0
+
+        try:
+            paid_taxes = taxes.pop((date, description + dividend_tax_description_suffix))
+        except KeyError:
+            raise Error("Unable to find paid taxes info for {} dividend.", dividend_info)
+
+        assert paid_taxes == _round_currency(amount * Decimal("0.1"))
+
+        dividends.append(Dividend(date, issuer, amount, paid_taxes=paid_taxes))
+
+    if taxes:
+        raise Error("There are unhandled taxes: {}.", taxes)
 
     return BrokerageIncome("Interactive Brokers", currency_rates, dividends=dividends)
+
+
+def parse_ib_date(date):
+    return datetime.datetime.strptime(date, "%Y-%m-%d").date()
+
+
+def strip_totals_from_ib_records(records, column):
+    if records and records[-1][column] == "Total":
+        records = records[:-1]
+
+    return records
 
 
 def parse_args():
@@ -613,7 +652,7 @@ def main():
 
         incomes = []
         if args.ib_statement is not None:
-            incomes.append(parse_ib_statement(args.ib_statement, currency_rates))
+            incomes.append(get_ib_brokerage_income(parse_ib_statement(args.ib_statement), currency_rates))
 
         for income in incomes:
             income.print()
