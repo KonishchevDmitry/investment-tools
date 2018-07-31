@@ -118,7 +118,7 @@ class Holding:
 
 class Portfolio:
     def __init__(self, name, currency, commission_spec: CommissionSpec, *, holdings: List[Holding], free_assets,
-                 min_free_assets, min_trade_volume=0):
+                 min_free_assets, min_trade_volume=0, free_commissions=None):
         self.name = name
         self.currency = currency
         self.commission_spec = commission_spec
@@ -126,6 +126,7 @@ class Portfolio:
         self.free_assets = Decimal(free_assets)
         self.min_free_assets = Decimal(min_free_assets)
         self.min_trade_volume = Decimal(min_trade_volume)
+        self.free_commissions = None if free_commissions is None else Decimal(free_commissions)
 
     def restrict_selling(self, restrict=True):
         apply_restriction(self.holdings, "selling_restricted", restrict)
@@ -572,7 +573,7 @@ def colorify_weight(string):
     return colored(string, "magenta", attrs=["bold"])
 
 
-def colorify_low_free_assets(string):
+def colorify_warning(string):
     return colored(string, "red")
 
 
@@ -648,10 +649,13 @@ def process_portfolio(action, portfolio: Portfolio, flat_view):
 
         formatted_free_assets = format_assets(free_assets, portfolio.currency)
         if free_assets < portfolio.min_free_assets:
-            formatted_free_assets = colorify_low_free_assets(formatted_free_assets)
+            formatted_free_assets = colorify_warning(formatted_free_assets)
         print(colorify_name("Free assets: ") + formatted_free_assets)
 
-        print(colorify_name("Commissions: ") + format_assets(commissions, portfolio.currency))
+        formatted_comissions = format_assets(commissions, portfolio.currency)
+        if portfolio.free_commissions is not None and commissions > portfolio.free_commissions:
+            formatted_comissions = colorify_warning(formatted_comissions)
+        print(colorify_name("Commissions: ") + formatted_comissions)
 
 
 def parse_args():
