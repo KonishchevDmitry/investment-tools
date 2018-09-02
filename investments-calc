@@ -5,6 +5,7 @@
 """Investments distribution calculator"""
 
 import argparse
+import logging
 import math
 import operator
 
@@ -14,6 +15,10 @@ from typing import List
 import requests
 
 from termcolor import colored
+
+import pcli.log
+
+log = logging.getLogger()
 
 
 class Actions:
@@ -88,6 +93,10 @@ class Holding:
         self.buy_blocked = False
 
     @property
+    def short_name(self):
+        return self.name if self.ticker is None else self.ticker
+
+    @property
     def is_group(self):
         return self.ticker is None
 
@@ -107,10 +116,27 @@ class Holding:
 
         return self
 
-    def change(self, shares, commission_spec: CommissionSpec):
+    def change(self, reason, shares, commission_spec: CommissionSpec):
+        if shares != self.shares:
+            log.debug("%s shares: %s -> %s (%s).", self.short_name, self.shares, shares, reason)
+
         self.commission = self.commission_for(shares, commission_spec)
         self.shares = shares
         self.value = shares * self.price
+
+    def set_weight(self, reason, weight):
+        if weight != self.weight:
+            log.debug("%s weight: %s -> %s (%s).", self.short_name, self.weight, weight, reason)
+
+        self.weight = weight
+
+    def on_buy_blocked(self, reason):
+        log.debug("%s: buy blocked: %s.", self.short_name, reason)
+        self.buy_blocked = True
+
+    def on_sell_blocked(self, reason):
+        log.debug("%s: sell blocked: %s.", self.short_name, reason)
+        self.sell_blocked = True
 
     def commission_for(self, shares, commission_spec: CommissionSpec):
         return commission_spec.calculate(abs(shares - self.current_shares), self.price)
@@ -290,7 +316,7 @@ def correct_weights_for_selling_restriction(holdings: List[Holding], expected_to
                         corrected_weight = holding.minimum_value / expected_total_value
                         succeeded = False
 
-                    holding.weight = corrected_weight
+                    holding.set_weight("selling restrictions", corrected_weight)
             else:
                 succeeded = False
 
@@ -337,7 +363,7 @@ def correct_weights_for_buying_restriction(holdings: List[Holding], expected_tot
                         corrected_weight = holding.maximum_value / expected_total_value
                         succeeded = False
 
-                    holding.weight = corrected_weight
+                    holding.set_weight("buying restrictions", corrected_weight)
             else:
                 succeeded = False
 
@@ -375,16 +401,16 @@ def rebalance(holdings: List[Holding], expected_total_value, commission_spec: Co
 
                 if rebalanced_shares != holding.current_shares:
                     if rebalanced_shares < holding.current_shares and holding.selling_restricted:
-                        holding.sell_blocked = True
+                        holding.on_sell_blocked("selling is restricted")
                     elif rebalanced_shares > holding.current_shares and holding.buying_restricted:
-                        holding.buy_blocked = True
+                        holding.on_buy_blocked("buying is restricted")
                     elif abs(rebalanced_shares - holding.current_shares) * holding.price < min_trade_volume:
                         if rebalanced_shares < holding.current_shares:
-                            holding.sell_blocked = True
+                            holding.on_sell_blocked("min trade volume restriction")
                         else:
-                            holding.buy_blocked = True
+                            holding.on_buy_blocked("min trade volume restriction")
                     else:
-                        holding.change(rebalanced_shares, commission_spec)
+                        holding.change("rebalancing", rebalanced_shares, commission_spec)
 
         total_value += holding.value
 
@@ -408,7 +434,7 @@ def distribute_free_assets(
     underfunded_only
 ):
     def difference_from_expected(holding: Holding):
-        expected_value = expected_total_value * holding.weight
+        expected_value = expected_total_value * holding.expected_weight
         if expected_value == 0:
             return -holding.value
         else:
@@ -418,7 +444,7 @@ def distribute_free_assets(
         if free_assets <= 0:
             return free_assets
 
-        expected_value = expected_total_value * holding.weight
+        expected_value = expected_total_value * holding.expected_weight
 
         if holding.is_group:
             free_assets = distribute_free_assets(
@@ -443,7 +469,7 @@ def distribute_free_assets(
                     result_shares > holding.current_shares and holding.buying_restricted or
                     abs(result_shares - holding.current_shares) * holding.price < min_trade_volume
                 ):
-                    holding.change(result_shares, commission_spec)
+                    holding.change("free assets distribution", result_shares, commission_spec)
                     free_assets -= extra_shares * holding.price - (holding.commission - previous_commission)
 
     return free_assets
@@ -661,6 +687,7 @@ def process_portfolio(action, portfolio: Portfolio, flat_view):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=Actions.ALL, help="action to process")
+    parser.add_argument("--debug", action="store_true", help="debug mode")
     parser.add_argument("--flat", action="store_true", help="flat view")
     return parser.parse_args()
 
@@ -668,6 +695,7 @@ def parse_args():
 def main():
     portfolios = []
     args = parse_args()
+    pcli.log.setup(level=logging.DEBUG if args.debug else logging.CRITICAL)
 
     for portfolio_id, portfolio in enumerate(portfolios):
         if portfolio_id:
