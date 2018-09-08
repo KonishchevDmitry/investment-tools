@@ -692,8 +692,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    portfolios = []
+def main(portfolios):
     args = parse_args()
     pcli.log.setup(level=logging.DEBUG if args.debug else logging.CRITICAL)
 
@@ -702,7 +701,3 @@ def main():
             print("\n")
 
         process_portfolio(args.action, portfolio, args.flat)
-
-
-if __name__ == "__main__":
-    main()
