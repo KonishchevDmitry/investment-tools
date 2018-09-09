@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+
+"""Investments distribution calculator example configuration"""
+
+from investments_calc import Portfolio, Holding, Currency, CommissionSpec, main
+
+# API key which should be acquired on https://www.alphavantage.co/support/#api-key (free).
+# If not specified, all stock prices will be faked.
+API_KEY = ""
+
+main([
+    Portfolio("IB", Currency.USD, CommissionSpec(per_share="0.005", minimum=1, maximum_percent=1), holdings=[
+        Holding("Stocks", "70%", holdings=[
+            Holding("USA", "75%", holdings=[
+                Holding("Vanguard Total Stock Market ETF", "75%", "VTI", 10),
+                Holding("Vanguard Information Technology ETF", "25%", "VGT", 20),
+            ]),
+            Holding("Vanguard Total International Stock ETF", "25%", "VXUS", 30),
+        ]),
+        Holding("Bonds", "30%", holdings=[
+            Holding("Vanguard Total Bond Market ETF", "50%", "BND", 40),
+            Holding("Vanguard International Bond ETF", "50%", "BNDX", 50),
+        ]),
+    ], free_assets=10000, min_free_assets=50, min_trade_volume=200).restrict_selling(),
+], api_key=API_KEY)
