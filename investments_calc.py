@@ -680,10 +680,10 @@ def process_portfolio(action, portfolio: Portfolio, api_key, flat_view):
             formatted_free_assets = colorify_warning(formatted_free_assets)
         print(colorify_name("Free assets: ") + formatted_free_assets)
 
-        formatted_comissions = format_assets(commissions, portfolio.currency)
+        formatted_commissions = format_assets(commissions, portfolio.currency)
         if portfolio.free_commissions is not None and commissions > portfolio.free_commissions:
-            formatted_comissions = colorify_warning(formatted_comissions)
-        print(colorify_name("Commissions: ") + formatted_comissions)
+            formatted_commissions = colorify_warning(formatted_commissions)
+        print(colorify_name("Commissions: ") + formatted_commissions)
 
 
 def parse_args():
