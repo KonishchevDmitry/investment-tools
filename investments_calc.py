@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-#
 # requirements.txt: requests termcolor
 
 """Investments distribution calculator"""
@@ -186,7 +184,7 @@ def apply_restriction(holdings: List[Holding], name, value):
                 setattr(holding, name, value)
 
 
-def calculate(portfolio: Portfolio, *, fake_prices=False):
+def calculate(portfolio: Portfolio, api_key, *, fake_prices=False):
     tickers = set()
 
     def process(name, holdings: List[Holding]):
@@ -200,11 +198,7 @@ def calculate(portfolio: Portfolio, *, fake_prices=False):
                 tickers.add(holding.ticker)
 
     process(portfolio.name, portfolio.holdings)
-
-    if fake_prices:
-        prices = {ticker: Decimal(1) for ticker in tickers}
-    else:
-        prices = get_prices(tickers)
+    prices = get_prices(tickers, api_key, fake_prices)
 
     current_value = calculate_current_value(portfolio.holdings, prices)
     total_assets = current_value + portfolio.free_assets
@@ -603,15 +597,24 @@ def colorify_warning(string):
     return colored(string, "red")
 
 
-def get_prices(tickers):
+def get_prices(tickers, api_key, fake_prices):
     prices = {}
     if not tickers:
         return prices
 
+    if not fake_prices and not api_key:
+        log.error(
+            "API key is not set. Please claim a free API key on https://www.alphavantage.co/support/#api-key. "
+            "Faking all stock prices.")
+        fake_prices = True
+
+    if fake_prices:
+        return {ticker: Decimal(1) for ticker in tickers}
+
     response = requests.get("https://www.alphavantage.co/query", params={
         "function": "BATCH_STOCK_QUOTES",
         "symbols": ",".join(tickers),
-        "apikey": "api-key-stub"
+        "apikey": api_key,
     })
     response.raise_for_status()
     result = response.json()
@@ -656,10 +659,8 @@ def get_prices(tickers):
     return prices
 
 
-def process_portfolio(action, portfolio: Portfolio, flat_view):
-    print(colorify_name(portfolio.name + ":"))
-
-    total_value, free_assets, commissions = calculate(portfolio, fake_prices=action == Actions.SHOW)
+def process_portfolio(action, portfolio: Portfolio, api_key, flat_view):
+    total_value, free_assets, commissions = calculate(portfolio, api_key, fake_prices=action == Actions.SHOW)
     if action == Actions.SHOW:
         total_value, free_assets, commissions = portfolio.free_assets, 0, 0
 
@@ -667,6 +668,7 @@ def process_portfolio(action, portfolio: Portfolio, flat_view):
         portfolio.holdings = flatify(portfolio.holdings, Decimal(1), Decimal(1))
         portfolio.holdings.sort(key=lambda holding: holding.value, reverse=True)
 
+    print(colorify_name(portfolio.name + ":"))
     show(action, portfolio, portfolio.holdings, total_value)
 
     if action == Actions.REBALANCE:
@@ -692,12 +694,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def main(portfolios):
+def main(portfolios, api_key):
     args = parse_args()
-    pcli.log.setup(level=logging.DEBUG if args.debug else logging.CRITICAL)
+    pcli.log.setup(level=logging.DEBUG if args.debug else logging.WARNING)
 
     for portfolio_id, portfolio in enumerate(portfolios):
         if portfolio_id:
             print("\n")
 
-        process_portfolio(args.action, portfolio, args.flat)
+        process_portfolio(args.action, portfolio, api_key, args.flat)
