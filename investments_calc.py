@@ -215,15 +215,20 @@ def calculate(portfolio: Portfolio, api_key, *, fake_prices=False):
     free_assets_to_distribute = free_assets - portfolio.min_free_assets
 
     for underfunded_only in (True, False):
-        while free_assets_to_distribute > 0:
-            free_assets_after_distribution = distribute_free_assets(
+        if free_assets_to_distribute <= 0:
+            break
+
+        log.debug("Trying to distribute free %s %s positions...",
+                  format_assets(free_assets_to_distribute, portfolio.currency),
+                  "over underfunded only" if underfunded_only else "all")
+
+        while True:
+            free_assets_to_distribute, distributed = distribute_free_assets(
                 portfolio.holdings, rebalanced_value, free_assets_to_distribute,
-                portfolio.commission_spec, portfolio.min_trade_volume, underfunded_only)
+                portfolio.currency, portfolio.commission_spec, portfolio.min_trade_volume, underfunded_only)
 
-            if free_assets_after_distribution == free_assets_to_distribute:
+            if not distributed:
                 break
-
-            free_assets_to_distribute = free_assets_after_distribution
 
     free_assets = free_assets_to_distribute + portfolio.min_free_assets
     rebalanced_value = sum(holding.value for holding in portfolio.holdings)
@@ -424,9 +429,12 @@ def calculate_total_commissions(holdings: List[Holding]):
 
 
 def distribute_free_assets(
-    holdings: List[Holding], expected_total_value, free_assets, commission_spec: CommissionSpec, min_trade_volume,
-    underfunded_only
+    holdings: List[Holding], expected_total_value, free_assets, currency,
+    commission_spec: CommissionSpec, min_trade_volume, underfunded_only
 ):
+    if free_assets <= 0:
+        return free_assets, False
+
     def difference_from_expected(holding: Holding):
         expected_value = expected_total_value * holding.expected_weight
         if expected_value == 0:
@@ -435,16 +443,26 @@ def distribute_free_assets(
             return (expected_value - holding.value) / expected_value
 
     for holding in sorted(holdings, key=difference_from_expected, reverse=True):
-        if free_assets <= 0:
-            return free_assets
-
         expected_value = expected_total_value * holding.expected_weight
 
+        if (
+            holding.expected_weight == 0 or  # A special case for deprecated positions
+            holding.value >= holding.current_value and holding.buying_restricted or
+            holding.value >= expected_value and underfunded_only
+        ):
+            continue
+
+        log.debug("Trying to distribute free %s over %s...", format_assets(free_assets, currency), holding.name)
+
         if holding.is_group:
-            free_assets = distribute_free_assets(
-                holding.holdings, expected_value, free_assets, commission_spec, min_trade_volume, underfunded_only)
-            holding.value = sum(holding.value for holding in holding.holdings)
-        elif not underfunded_only or holding.value < expected_value:
+            free_assets, distributed = distribute_free_assets(
+                holding.holdings, expected_value, free_assets, currency, commission_spec, min_trade_volume,
+                underfunded_only)
+
+            if distributed:
+                holding.value = sum(holding.value for holding in holding.holdings)
+                return free_assets, True
+        else:
             previous_commission = holding.commission
             extra_shares = (free_assets + previous_commission) // holding.price
             extra_shares = limit_extra_shares_to_minimum(holding, extra_shares, min_trade_volume)
@@ -465,8 +483,9 @@ def distribute_free_assets(
                 ):
                     holding.change("free assets distribution", result_shares, commission_spec)
                     free_assets -= extra_shares * holding.price - (holding.commission - previous_commission)
+                    return free_assets, True
 
-    return free_assets
+    return free_assets, False
 
 
 def limit_extra_shares_to_minimum(holding: Holding, extra_shares, min_trade_volume):
