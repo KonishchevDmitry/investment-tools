@@ -313,7 +313,8 @@ def correct_weights_for_selling_restriction(holdings: List[Holding], expected_to
                         expected_total_value * corrected_weight < holding.minimum_value
                     ):
                         corrected_weight = holding.minimum_value / expected_total_value
-                        succeeded = False
+                        if corrected_weight != holding.weight:
+                            succeeded = False
 
                     holding.set_weight("selling restrictions", corrected_weight)
             else:
@@ -360,7 +361,8 @@ def correct_weights_for_buying_restriction(holdings: List[Holding], expected_tot
                         expected_total_value * corrected_weight > holding.maximum_value
                     ):
                         corrected_weight = holding.maximum_value / expected_total_value
-                        succeeded = False
+                        if corrected_weight != holding.weight:
+                            succeeded = False
 
                     holding.set_weight("buying restrictions", corrected_weight)
             else:
