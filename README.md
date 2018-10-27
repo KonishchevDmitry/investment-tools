@@ -16,6 +16,8 @@ file (Russian tax program named Декларация) by adding all required inf
 right, script requires a fake foreign dividend income to be specified in income statement named `dividend` - it finds
 it, checks that it's able to parse it and understand and only after that alters the *.dcX file.
 
+**Update:** The script is deprecated by https://github.com/KonishchevDmitry/investments.
+
 ### investments_calc.py
 
 This module helps you in asset allocation if you want to periodically rebalance your portfolio. You create a script that
