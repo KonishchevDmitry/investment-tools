@@ -7,6 +7,8 @@ Scripts are intentionally single-file to eliminate the need to install them, to 
 restrain their grow and gradual transformation into a full-fledged applications for which I don't have a free time to
 support and evolve.
 
+**Update: The scripts are deprecated by https://github.com/KonishchevDmitry/investments.**
+
 ### income-statement-automizer
 
 This script reads [Interactive Brokers](https://www.interactivebrokers.com/) statements and automatically alters *.dcX
@@ -15,8 +17,6 @@ file (Russian tax program named Декларация) by adding all required inf
 *.dcX is a proprietary and very weird format which changes every year, so to make sure that everything will be done
 right, script requires a fake foreign dividend income to be specified in income statement named `dividend` - it finds
 it, checks that it's able to parse it and understand and only after that alters the *.dcX file.
-
-**Update:** The script is deprecated by https://github.com/KonishchevDmitry/investments.
 
 ### investments_calc.py
 
